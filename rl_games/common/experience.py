@@ -245,6 +245,10 @@ class VectorizedReplayBuffer:
         self.idx = (self.idx + num_observations) % self.capacity
         self.full = self.full or self.idx == 0
 
+    @property
+    def size(self):
+        return self.capacity if self.full else self.idx
+
     def sample(self, batch_size):
         """Sample a batch of experiences.
         Parameters
@@ -268,7 +272,7 @@ class VectorizedReplayBuffer:
         """
 
         idxs = torch.randint(0,
-                            self.capacity if self.full else self.idx, 
+                            self.size, 
                             (batch_size,), device=self.device)
         obses = self.obses[idxs]
         actions = self.actions[idxs]
@@ -279,7 +283,205 @@ class VectorizedReplayBuffer:
         return obses, actions, rewards, next_obses, dones
 
 
+class AchievementBuffer:
+    def __init__(self, batch_size, obs_shape, action_shape, length, capacity, minimum_length, device):
+        """Create Vectorized Replay buffer.
+        Parameters
+        ----------
+        size: int
+            Max number of transitions to store in the buffer. When the buffer
+            overflows the old memories are dropped.
+        See Also
+        --------
+        ReplayBuffer.__init__
+        """
 
+        self.device = device
+
+        self.obses = torch.empty((capacity, length, *obs_shape), dtype=torch.float32, device=self.device)
+        self.next_obses = torch.empty((capacity, length, *obs_shape), dtype=torch.float32, device=self.device)
+        self.actions = torch.empty((capacity, length, *action_shape), dtype=torch.float32, device=self.device)
+        self.valids = torch.empty((capacity, length,), dtype=torch.bool, device=self.device)
+
+        self.tmp_obses = torch.zeros((batch_size, length, *obs_shape), dtype=torch.float32, device=self.device)
+        self.tmp_next_obses = torch.zeros((batch_size, length, *obs_shape), dtype=torch.float32, device=self.device)
+        self.tmp_actions = torch.zeros((batch_size, length, *action_shape), dtype=torch.float32, device=self.device)
+        self.tmp_valids = torch.zeros((batch_size, length,), dtype=torch.bool, device=self.device)
+
+        self.batch_size = batch_size
+        self.length = length
+        self.minimum_length = minimum_length
+        self.capacity = capacity
+        self.full = False
+        # print(self.capacity)
+        self.true_size = 0
+        self.true_episode_length = [0 for _ in range(batch_size)]
+
+    def add(self, i_batch, obs, action, next_obs):
+        if self.true_episode_length[i_batch] < self.length:
+            idx = self.true_episode_length[i_batch]
+        else:
+            idx = np.random.randint(self.true_episode_length[i_batch] + 1)
+        if idx < self.length:
+            self.tmp_obses[i_batch, idx] = obs.detach().clone()
+            self.tmp_actions[i_batch, idx] = action.detach().clone()
+            self.tmp_next_obses[i_batch, idx] = next_obs.detach().clone()
+            self.tmp_valids[i_batch, idx] = True
+        self.true_episode_length[i_batch] += 1
+
+    def episode_done(self, i_batch):
+        # print(i_batch, self.true_episode_length)
+        if self.true_episode_length[i_batch] >= self.minimum_length:
+            episode_length = min(self.length, self.true_episode_length[i_batch])
+            self.tmp_valids[i_batch, episode_length:] = False
+            # print(self.tmp_valids[i_batch], episode_length)
+            if self.true_size < self.capacity:
+                idx = self.true_size
+            else:
+                idx = np.random.randint(self.true_size + 1)
+            if idx < self.capacity:
+                self.obses[idx][:] = self.tmp_obses[i_batch].detach().clone()
+                self.next_obses[idx][:] = self.tmp_next_obses[i_batch].detach().clone()
+                self.actions[idx][:] = self.tmp_actions[i_batch].detach().clone()
+                self.valids[idx][:] = self.tmp_valids[i_batch].detach().clone()
+            self.true_size += 1
+            self.full = self.true_size >= self.capacity
+        self.true_episode_length[i_batch] = 0
+
+    @property
+    def size(self):
+        return self.capacity if self.full else self.true_size
+
+    def sample(self, batch_size):
+        """Sample a batch of experiences.
+        Parameters
+        ----------
+        batch_size: int
+            How many transitions to sample.
+        Returns
+        -------
+        obses: torch tensor
+            batch of observations
+        actions: torch tensor
+            batch of actions executed given obs
+        rewards: torch tensor
+            rewards received as results of executing act_batch
+        next_obses: torch tensor
+            next set of observations seen after executing act_batch
+        not_dones: torch tensor
+            inverse of whether the episode ended at this tuple of (observation, action) or not
+        not_dones_no_max: torch tensor
+            inverse of whether the episode ended at this tuple of (observation, action) or not, specifically exlcuding maximum episode steps
+        """
+
+        idxs = torch.randint(0,
+                            self.size, 
+                            (batch_size,), device=self.device)
+        obses = self.obses[idxs].detach().clone()
+        actions = self.actions[idxs].detach().clone()
+        next_obses = self.next_obses[idxs].detach().clone()
+        valid = self.valids[idxs].detach().clone()
+
+        return obses, actions, next_obses, valid
+
+
+class SEABuffer:
+    def __init__(self, obs_shape, action_shape, length, capacity, minimum_length, device):
+        """Create Vectorized Replay buffer.
+        Parameters
+        ----------
+        size: int
+            Max number of transitions to store in the buffer. When the buffer
+            overflows the old memories are dropped.
+        See Also
+        --------
+        ReplayBuffer.__init__
+        """
+
+        self.device = device
+
+        self.capacity = capacity * length // 2
+
+        self.obses = [torch.empty((self.capacity, *obs_shape), dtype=torch.float32, device=self.device) for _ in range(2)]
+        self.next_obses = [torch.empty((self.capacity, *obs_shape), dtype=torch.float32, device=self.device) for _ in range(2)]
+        self.actions = [torch.empty((self.capacity, *action_shape), dtype=torch.float32, device=self.device) for _ in range(2)]
+        self.rewards = [torch.empty((self.capacity,), dtype=torch.float32, device=self.device) for _ in range(2)]
+
+        self.true_size = [0, 0]
+        self.full = [False, False]
+
+    def _add(self, w, obs, action, next_obs, reward):
+        if self.true_size[w] < self.capacity:
+            idx = self.true_size[w]
+        else:
+            idx = np.random.randint(self.true_size[w] + 1)
+        if idx < self.capacity:
+            self.obses[w][idx] = obs.detach().clone()
+            self.actions[w][idx] = action.detach().clone()
+            self.next_obses[w][idx] = next_obs.detach().clone()
+            self.rewards[w][idx] = reward.detach().clone()
+            self.true_size[w] += 1
+
+    def add(self, obs, action, next_obs, reward):
+        w = int(reward > 0.5)
+        self._add(w, obs, action, next_obs, reward)
+
+        # if self.true_size < self.capacity:
+        #     idx = self.true_size
+        # else:
+        #     idx = np.random.randint(self.true_size + 1)
+        # if idx < self.capacity:
+        #     self.obses[idx][:] = obs
+        #     self.actions[idx][:] = action
+        #     self.next_obses[idx][:] = next_obs
+        #     self.rewards[idx] = reward
+        #     self.true_size += 1
+        #     self.full = self.true_size >= self.capacity
+
+    def _size(self, w):
+        return min(self.capacity, self.true_size[w])
+
+    @property
+    def size(self):
+        return self._size(0) + self._size(1)
+    
+    def _sample(self, w, batch_size):
+        idxs = torch.randint(0,
+                            self._size(w), 
+                            (batch_size,), device=self.device)
+        obses = self.obses[w][idxs].detach().clone()
+        actions = self.actions[w][idxs].detach().clone()
+        next_obses = self.next_obses[w][idxs].detach().clone()
+        rewards = self.rewards[w][idxs].detach().clone()
+
+        return obses, actions, next_obses, rewards
+
+    def sample(self, batch_size):
+        """Sample a batch of experiences.
+        Parameters
+        ----------
+        batch_size: int
+            How many transitions to sample.
+        Returns
+        -------
+        obses: torch tensor
+            batch of observations
+        actions: torch tensor
+            batch of actions executed given obs
+        rewards: torch tensor
+            rewards received as results of executing act_batch
+        next_obses: torch tensor
+            next set of observations seen after executing act_batch
+        not_dones: torch tensor
+            inverse of whether the episode ended at this tuple of (observation, action) or not
+        not_dones_no_max: torch tensor
+            inverse of whether the episode ended at this tuple of (observation, action) or not, specifically exlcuding maximum episode steps
+        """
+
+        obses_0, actions_0, next_obses_0, rewards_0 = self._sample(0, batch_size // 2)
+        obses_1, actions_1, next_obses_1, rewards_1 = self._sample(1, batch_size - batch_size // 2)
+
+        return torch.cat((obses_0, obses_1), 0), torch.cat((actions_0, actions_1), 0), torch.cat((next_obses_0, next_obses_1), 0), torch.cat((rewards_0, rewards_1), 0)
 
 
 class ExperienceBuffer:

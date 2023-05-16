@@ -362,3 +362,31 @@ class ModelSACContinuous(BaseModel):
 
 
 
+class ModelSEA(BaseModel):
+    def __init__(self, network):
+        BaseModel.__init__(self, 'a2c')
+        self.network_builder = network
+
+    class Network(BaseModelNetwork):
+        def __init__(self, a2c_network, **kwargs):
+            BaseModelNetwork.__init__(self, **kwargs)
+            self.a2c_network = a2c_network
+
+        def is_rnn(self):
+            return self.a2c_network.is_rnn()
+
+        def get_value_layer(self):
+            return self.a2c_network.get_value_layer()
+
+        def get_default_rnn_state(self):
+            return self.a2c_network.get_default_rnn_state()
+
+        def kl(self, p_dict, q_dict):
+            return None # or throw exception?
+
+        def forward(self, input_dict):
+            input_dict['obs'] = self.norm_obs(input_dict['obs'])
+            input_dict['next_obs'] = self.norm_obs(input_dict['next_obs'])
+            embeds, preds = self.a2c_network.get_sea_embedding(input_dict)
+
+            return embeds, preds

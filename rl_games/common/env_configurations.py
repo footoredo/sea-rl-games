@@ -8,6 +8,7 @@ import gym
 from gym.wrappers import FlattenObservation, FilterObservation
 import numpy as np
 import math
+import crafter
 
 
 
@@ -243,6 +244,10 @@ def create_env(name, **kwargs):
     return env
 
 configurations = {
+    'CrafterNew-v1' : {
+        'vecenv_type' : 'RAY',
+        'env_creator' : lambda **kwargs : gym.make('CrafterNew-v1', **kwargs),
+    },
     'CartPole-v1' : {
         'vecenv_type' : 'RAY',
         'env_creator' : lambda **kwargs : gym.make('CartPole-v1'),

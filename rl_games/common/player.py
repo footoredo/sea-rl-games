@@ -5,6 +5,7 @@ import torch
 import copy
 from rl_games.common import vecenv
 from rl_games.common import env_configurations
+from rl_games.common.sea_wrapper import SEAWrapper
 from rl_games.algos_torch import model_builder
 
 
@@ -12,6 +13,8 @@ class BasePlayer(object):
 
     def __init__(self, params):
         self.config = config = params['config']
+        self.use_sea = config.get('use_sea', False)
+        self.sea_config = config.get('sea_config', {})
         self.load_networks(params)
         self.env_name = self.config['env_name']
         self.player_config = self.config.get('player', {})
@@ -25,7 +28,7 @@ class BasePlayer(object):
             if use_vecenv:
                 print('[BasePlayer] Creating vecenv: ', self.env_name)
                 self.env = vecenv.create_vec_env(
-                    self.env_name, self.config['num_actors'], **self.env_config)
+                    self.env_name, self.config['num_actors'], self.use_sea, self.sea_config, **self.env_config)
                 self.env_info = self.env.get_env_info()
             else:
                 print('[BasePlayer] Creating regular env: ', self.env_name)
@@ -69,8 +72,18 @@ class BasePlayer(object):
         self.device = torch.device(self.device_name)
 
     def load_networks(self, params):
+        network_params = copy.copy(params['network'])
         builder = model_builder.ModelBuilder()
         self.config['network'] = builder.load(params)
+
+        if self.use_sea:
+            print('Adding SEA net')
+            if 'model' not in params['config']['sea_config']:
+                params['config']['sea_config']['model'] = {'name': 'sea'}
+            if 'network' not in params['config']['sea_config']:
+                params['config']['sea_config']['network'] = network_params
+            network = builder.load(params['config']['sea_config'])
+            self.config['sea_config']['network'] = network
 
     def _preproc_obs(self, obs_batch):
         if type(obs_batch) is dict:
@@ -161,7 +174,11 @@ class BasePlayer(object):
                 weights['running_mean_std'])
 
     def create_env(self):
-        return env_configurations.configurations[self.env_name]['env_creator'](**self.env_config)
+        env = env_configurations.configurations[self.env_name]['env_creator'](**self.env_config)
+        if self.use_sea:
+            objective_dim = self.sea_config['objective_dim']
+            env = SEAWrapper(env, objective_dim)
+        return env
 
     def get_action(self, obs, is_deterministic=False):
         raise NotImplementedError('step')
@@ -201,6 +218,10 @@ class BasePlayer(object):
         if has_masks_func:
             has_masks = self.env.has_action_mask()
 
+        if self.use_sea:
+            sea_embeds = []
+            sea_preds = []
+
         need_init_rnn = self.is_rnn
         for _ in range(n_games):
             if games_played >= n_games:
@@ -219,6 +240,10 @@ class BasePlayer(object):
 
             print_game_res = False
 
+            if self.use_sea:
+                batch_sea_embeds = [[] for _ in range(batch_size)]
+                batch_sea_preds = [[] for _ in range(batch_size)]
+
             for n in range(self.max_steps):
                 if has_masks:
                     masks = self.env.get_action_mask()
@@ -227,9 +252,38 @@ class BasePlayer(object):
                 else:
                     action = self.get_action(obses, is_deterministic)
 
+                last_obses = obses
+
                 obses, r, done, info = self.env_step(self.env, action)
                 cr += r
                 steps += 1
+
+                if self.use_sea:
+                    for i in range(batch_size):
+                        if r[i] > 0.1:
+                            if self.has_batch_dimension:
+                                obs = last_obses['observation'][i: i + 1]
+                                next_obs = obses['observation'][i: i + 1]
+                                _action = action[i: i + 1]
+                            else:
+                                obs = last_obses['observation'].unsqueeze(0)
+                                next_obs = obses['observation'].unsqueeze(0)
+                                _action = action.unsqueeze(0)
+                            sea_embed, sea_pred = self.sea_net.get_sea_outputs(
+                                obs=self._preproc_obs(obs),
+                                next_obs=self._preproc_obs(next_obs),
+                                action=_action
+                            )
+                            sea_embed = sea_embed[0]
+                            sea_pred = sea_pred[0]
+                            batch_sea_embeds[i].append(sea_embed.detach().cpu().numpy())
+                            batch_sea_preds[i].append(sea_pred.detach().cpu().numpy())
+                        if done[i]:
+                            if len(batch_sea_embeds[i]) > 0:
+                                sea_embeds.append(batch_sea_embeds[i])
+                                sea_preds.append(batch_sea_preds[i])
+                            batch_sea_embeds[i] = []
+                            batch_sea_preds[i] = []
 
                 if render:
                     self.env.render(mode='human')
@@ -275,7 +329,15 @@ class BasePlayer(object):
                     if batch_size//self.num_agents == 1 or games_played >= n_games:
                         break
 
-        print(sum_rewards)
+            if self.use_sea:
+                for i in range(batch_size):
+                    if len(batch_sea_embeds[i]) > 0:
+                        sea_embeds.append(batch_sea_embeds[i])
+
+        self.sea_embeds = sea_embeds
+        self.sea_preds = sea_preds
+
+        # print(sum_rewards)
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps /
                   games_played * n_game_life, 'winrate:', sum_game_res / games_played * n_game_life)

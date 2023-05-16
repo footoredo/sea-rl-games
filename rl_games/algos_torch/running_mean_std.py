@@ -89,5 +89,5 @@ class RunningMeanStdObs(nn.Module):
         })
     
     def forward(self, input, denorm=False):
-        res = {k : self.running_mean_std[k](v, denorm) for k,v in input.items()}
+        res = {k : self.running_mean_std[k](v, denorm) if k != "objective" else v for k,v in input.items()}
         return res

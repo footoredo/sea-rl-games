@@ -1,5 +1,6 @@
 import ray
 from rl_games.common.ivecenv import IVecEnv
+from rl_games.common.sea_wrapper import SEAVecWrapper
 from rl_games.common.env_configurations import configurations
 from rl_games.common.tr_helpers import dicts_to_dict_with_arrays
 import numpy as np
@@ -217,9 +218,13 @@ vecenv_config = {}
 def register(config_name, func):
     vecenv_config[config_name] = func
 
-def create_vec_env(config_name, num_actors, **kwargs):
+def create_vec_env(config_name, num_actors, use_sea=False, sea_config={}, **kwargs):
     vec_env_name = configurations[config_name]['vecenv_type']
-    return vecenv_config[vec_env_name](config_name, num_actors, **kwargs)
+    vecenv = vecenv_config[vec_env_name](config_name, num_actors, **kwargs)
+    if use_sea:
+        objective_dim = sea_config["objective_dim"]
+        vecenv = SEAVecWrapper(vecenv, objective_dim=objective_dim)
+    return vecenv
 
 register('RAY', lambda config_name, num_actors, **kwargs: RayVecEnv(config_name, num_actors, **kwargs))
 

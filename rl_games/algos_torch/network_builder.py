@@ -193,9 +193,19 @@ class A2CBuilder(NetworkBuilder):
     class Network(NetworkBuilder.BaseNetwork):
         def __init__(self, params, **kwargs):
             actions_num = kwargs.pop('actions_num')
+            self.actions_num = actions_num
             input_shape = kwargs.pop('input_shape')
             self.value_size = kwargs.pop('value_size', 1)
             self.num_seqs = num_seqs = kwargs.pop('num_seqs', 1)
+            self.use_sea = kwargs.pop('use_sea', False)
+            self.use_objective = False
+            if isinstance(input_shape, dict):
+                self.use_objective = 'objective' in input_shape
+                assert self.use_objective
+                if self.use_objective:
+                    self.num_objectives = input_shape['objective'][0]
+                    input_shape = input_shape['observation']
+            print('self.use_objective', self.use_objective)
             NetworkBuilder.BaseNetwork.__init__(self)
             self.load(params)
             self.actor_cnn = nn.Sequential()
@@ -219,6 +229,10 @@ class A2CBuilder(NetworkBuilder):
                     self.critic_cnn = self._build_conv( **cnn_args)
 
             mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
+            if self.use_objective:
+                mlp_input_shape += self.num_objectives
+
+            # print(mlp_input_shape, input_shape)
 
             in_mlp_shape = mlp_input_shape
             if len(self.units) == 0:
@@ -226,7 +240,7 @@ class A2CBuilder(NetworkBuilder):
             else:
                 out_size = self.units[-1]
 
-            if self.has_rnn:
+            if self.has_rnn and not self.use_sea:
                 if not self.is_rnn_before_mlp:
                     rnn_in_size = out_size
                     out_size = self.rnn_units
@@ -247,6 +261,8 @@ class A2CBuilder(NetworkBuilder):
                     if self.rnn_ln:
                         self.layer_norm = torch.nn.LayerNorm(self.rnn_units)
 
+            print(in_mlp_shape)
+
             mlp_args = {
                 'input_size' : in_mlp_shape, 
                 'units' : self.units, 
@@ -260,27 +276,35 @@ class A2CBuilder(NetworkBuilder):
             if self.separate:
                 self.critic_mlp = self._build_mlp(**mlp_args)
 
-            self.value = self._build_value_layer(out_size, self.value_size)
-            self.value_act = self.activations_factory.create(self.value_activation)
+            if self.use_sea:
+                sea_mlp_args = mlp_args
+                sea_mlp_args['units'] = [256, 256]
+                sea_mlp_args['input_size'] = self.units[-1] + actions_num
+                self.sea_mlp = self._build_mlp(**sea_mlp_args)
+                self.sea_pred = self._build_value_layer(256, 1)
+            else:
 
-            if self.is_discrete:
-                self.logits = torch.nn.Linear(out_size, actions_num)
-            '''
-                for multidiscrete actions num is a tuple
-            '''
-            if self.is_multi_discrete:
-                self.logits = torch.nn.ModuleList([torch.nn.Linear(out_size, num) for num in actions_num])
-            if self.is_continuous:
-                self.mu = torch.nn.Linear(out_size, actions_num)
-                self.mu_act = self.activations_factory.create(self.space_config['mu_activation']) 
-                mu_init = self.init_factory.create(**self.space_config['mu_init'])
-                self.sigma_act = self.activations_factory.create(self.space_config['sigma_activation']) 
-                sigma_init = self.init_factory.create(**self.space_config['sigma_init'])
+                self.value = self._build_value_layer(out_size, self.value_size)
+                self.value_act = self.activations_factory.create(self.value_activation)
 
-                if self.fixed_sigma:
-                    self.sigma = nn.Parameter(torch.zeros(actions_num, requires_grad=True, dtype=torch.float32), requires_grad=True)
-                else:
-                    self.sigma = torch.nn.Linear(out_size, actions_num)
+                if self.is_discrete:
+                    self.logits = torch.nn.Linear(out_size, actions_num)
+                '''
+                    for multidiscrete actions num is a tuple
+                '''
+                if self.is_multi_discrete:
+                    self.logits = torch.nn.ModuleList([torch.nn.Linear(out_size, num) for num in actions_num])
+                if self.is_continuous:
+                    self.mu = torch.nn.Linear(out_size, actions_num)
+                    self.mu_act = self.activations_factory.create(self.space_config['mu_activation']) 
+                    mu_init = self.init_factory.create(**self.space_config['mu_init'])
+                    self.sigma_act = self.activations_factory.create(self.space_config['sigma_activation']) 
+                    sigma_init = self.init_factory.create(**self.space_config['sigma_init'])
+
+                    if self.fixed_sigma:
+                        self.sigma = nn.Parameter(torch.zeros(actions_num, requires_grad=True, dtype=torch.float32), requires_grad=True)
+                    else:
+                        self.sigma = torch.nn.Linear(out_size, actions_num)
 
             mlp_init = self.init_factory.create(**self.initializer)
             if self.has_cnn:
@@ -296,33 +320,79 @@ class A2CBuilder(NetworkBuilder):
                     if getattr(m, "bias", None) is not None:
                         torch.nn.init.zeros_(m.bias)    
 
-            if self.is_continuous:
+            if self.is_continuous and not self.use_sea:
                 mu_init(self.mu.weight)
                 if self.fixed_sigma:
                     sigma_init(self.sigma)
                 else:
                     sigma_init(self.sigma.weight)  
 
-        def forward(self, obs_dict):
-            obs = obs_dict['obs']
-            states = obs_dict.get('rnn_states', None)
-            seq_length = obs_dict.get('seq_length', 1)
-            dones = obs_dict.get('dones', None)
-            bptt_len = obs_dict.get('bptt_len', 0)
+        def get_obs_embedding(self, obs, do_mlp=False):
             if self.has_cnn:
                 # for obs shape 4
                 # input expected shape (B, W, H, C)
                 # convert to (B, C, W, H)
                 if self.permute_input and len(obs.shape) == 4:
                     obs = obs.permute((0, 3, 1, 2))
-
+            
             if self.separate:
                 a_out = c_out = obs
                 a_out = self.actor_cnn(a_out)
                 a_out = a_out.contiguous().view(a_out.size(0), -1)
 
                 c_out = self.critic_cnn(c_out)
-                c_out = c_out.contiguous().view(c_out.size(0), -1)                    
+                c_out = c_out.contiguous().view(c_out.size(0), -1)
+
+                if do_mlp:
+                    a_out = self.actor_mlp(a_out)
+                    c_out = self.critic_mlp(c_out)
+
+                return a_out, c_out
+            
+            else:
+                out = obs
+                out = self.actor_cnn(out)
+                out = out.flatten(1)
+                if do_mlp:
+                    out = self.actor_mlp(out)
+
+                return out, out
+            
+        def get_sea_embedding(self, input_dict):
+            obs = input_dict['obs']
+            next_obs = input_dict['next_obs']
+            action = input_dict['action']
+            obs_embed = self.get_obs_embedding(obs, do_mlp=True)[1]
+            next_obs_embed = self.get_obs_embedding(next_obs, do_mlp=True)[1]
+            num_units = obs_embed.shape[-1] // 2
+            if self.is_discrete:
+                action = torch.nn.functional.one_hot(action.long(), num_classes=self.actions_num)
+            obs_embed = obs_embed[:, :num_units]
+            next_obs_embed = next_obs_embed[:, num_units:]
+            # obs_embed = torch.zeros_like(obs_embed)
+            # action = torch.zeros_like(action)
+            sea_input = torch.cat((obs_embed, next_obs_embed, action), 1)
+            # sea_input = torch.zeros_like(sea_input)
+            # sea_input[:, 0] = next_obs[:, 0]
+            embed = self.sea_mlp(sea_input)
+            out = self.sea_pred(embed)
+            return embed, out
+
+        def forward(self, obs_dict):
+            obs = obs_dict['obs']
+            if self.use_objective:
+                obs, objective = obs['observation'], obs['objective']
+            states = obs_dict.get('rnn_states', None)
+            seq_length = obs_dict.get('seq_length', 1)
+            dones = obs_dict.get('dones', None)
+            bptt_len = obs_dict.get('bptt_len', 0)
+
+            if self.separate:
+                a_out, c_out = self.get_obs_embedding(obs)
+
+                if self.use_objective:
+                    a_out = torch.cat([a_out, objective], 1)
+                    c_out = torch.cat([c_out, objective], 1)
 
                 if self.has_rnn:
                     if not self.is_rnn_before_mlp:
@@ -393,9 +463,10 @@ class A2CBuilder(NetworkBuilder):
 
                     return mu, sigma, value, states
             else:
-                out = obs
-                out = self.actor_cnn(out)
-                out = out.flatten(1)                
+                out = self.get_obs_embedding(obs)[0]
+
+                if self.use_objective:
+                    out = torch.cat([out, objective], 1)
 
                 if self.has_rnn:
                     out_in = out

@@ -34,3 +34,36 @@ class IVecEnv:
 
     def set_env_state(self, env_state):
         pass
+
+
+class IVecEnvWrapper(IVecEnv):
+    def __init__(self, env: IVecEnv):
+        super().__init__()
+        self.env = env
+    
+    def step(self, actions):
+        return self.env.step(actions)
+    
+    def reset(self):
+        return self.env.reset()
+
+    def has_action_masks(self):
+        return self.env.has_action_masks()
+    
+    def get_number_of_agents(self):
+        return self.env.get_number_of_agents()
+
+    def get_env_info(self):
+        return self.env.get_env_info()
+
+    def seed(self, seed):
+        return self.env.seed(seed)
+
+    def set_train_info(self, env_frames, *args, **kwargs):
+        return self.env.set_train_info(env_frames, *args, **kwargs)
+
+    def get_env_state(self):
+        return self.env.get_env_state()
+
+    def set_env_state(self, env_state):
+        return self.env.set_env_state(env_state)

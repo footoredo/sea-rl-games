@@ -1,7 +1,7 @@
 from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
 
-from rl_games.algos_torch import central_value
+from rl_games.algos_torch import central_value, sea
 from rl_games.common import common_losses
 from rl_games.common import datasets
 
@@ -21,7 +21,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             'num_seqs' : self.num_actors * self.num_agents,
             'value_size': self.env_info.get('value_size',1),
             'normalize_value' : self.normalize_value,
-            'normalize_input': self.normalize_input,
+            'normalize_input': self.normalize_input
         }
         
         self.model = self.network.build(build_config)
@@ -51,6 +51,25 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 'zero_rnn_on_done' : self.zero_rnn_on_done
             }
             self.central_value_net = central_value.CentralValueTrain(**cv_config).to(self.ppo_device)
+        
+        if self.use_sea:
+            sea_config = {
+                'state_shape' : self.obs_shape['observation'], 
+                'value_size' : self.value_size,
+                'ppo_device' : self.ppo_device, 
+                'num_agents' : self.num_agents, 
+                'horizon_length' : self.horizon_length,
+                'num_actors' : self.num_actors, 
+                'num_actions' : self.actions_num, 
+                'seq_len' : self.seq_len,
+                'normalize_value' : self.normalize_value,
+                'network' : self.sea_config['network'],
+                'config' : self.sea_config, 
+                'writter' : self.writer,
+                'max_epochs' : self.max_epochs,
+                'multi_gpu' : self.multi_gpu,
+            }
+            self.sea_net = sea.SEATrain(**sea_config).to(self.ppo_device)
 
         self.use_experimental_cv = self.config.get('use_experimental_cv', True)
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_len)

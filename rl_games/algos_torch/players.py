@@ -1,5 +1,5 @@
 from rl_games.common.player import BasePlayer
-from rl_games.algos_torch import torch_ext
+from rl_games.algos_torch import torch_ext, sea
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.common.tr_helpers import unsqueeze_obs
 import gym
@@ -41,6 +41,29 @@ class PpoPlayerContinuous(BasePlayer):
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
+        # print(self.use_sea)
+
+        if self.use_sea:
+            sea_config = {
+                'state_shape' : obs_shape['observation'], 
+                'value_size' : self.value_size,
+                'ppo_device' : self.device, 
+                'num_agents' : self.num_agents, 
+                'horizon_length' : 0,
+                'num_actors' : 1, 
+                'num_actions' : self.actions_num, 
+                'seq_len' : 0,
+                'normalize_value' : self.normalize_value,
+                'network' : self.sea_config['network'],
+                'config' : self.sea_config, 
+                'writter' : None,
+                'max_epochs' : 0,
+                'multi_gpu' : False,
+            }
+            self.sea_net = sea.SEATrain(**sea_config).to(self.device)
+            self.sea_net.eval()
+            # print(self.sea_net)
+
     def get_action(self, obs, is_deterministic = False):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
@@ -73,6 +96,11 @@ class PpoPlayerContinuous(BasePlayer):
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+
+        print(checkpoint.keys())
+
+        if self.use_sea:
+            self.sea_net.load_state_dict(checkpoint['sea_net'])
 
         env_state = checkpoint.get('env_state', None)
         if self.env is not None and env_state is not None:
@@ -109,6 +137,26 @@ class PpoPlayerDiscrete(BasePlayer):
         self.model.to(self.device)
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
+
+        if self.use_sea:
+            sea_config = {
+                'state_shape' : obs_shape['observation'], 
+                'value_size' : self.value_size,
+                'ppo_device' : self.device, 
+                'num_agents' : self.num_agents, 
+                'horizon_length' : 0,
+                'num_actors' : 1, 
+                'num_actions' : self.actions_num, 
+                'seq_len' : 0,
+                'normalize_value' : self.normalize_value,
+                'network' : self.sea_config['network'],
+                'config' : self.sea_config, 
+                'writter' : None,
+                'max_epochs' : 0,
+                'multi_gpu' : False,
+            }
+            self.sea_net = sea.SEATrain(**sea_config).to(self.device)
+            self.sea_net.eval()
 
     def get_masked_action(self, obs, action_masks, is_deterministic = True):
         if self.has_batch_dimension == False:
@@ -176,6 +224,9 @@ class PpoPlayerDiscrete(BasePlayer):
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
+        if self.use_sea:
+            self.sea_net.load_state_dict(checkpoint['sea_net'])
+
         env_state = checkpoint.get('env_state', None)
         if self.env is not None and env_state is not None:
             self.env.set_env_state(env_state)
@@ -210,6 +261,26 @@ class SACPlayer(BasePlayer):
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
+        if self.use_sea:
+            sea_config = {
+                'state_shape' : obs_shape['observation'], 
+                'value_size' : self.value_size,
+                'ppo_device' : self.device, 
+                'num_agents' : self.num_agents, 
+                'horizon_length' : 0,
+                'num_actors' : 1, 
+                'num_actions' : self.actions_num, 
+                'seq_len' : 0,
+                'normalize_value' : False,
+                'network' : self.sea_config['network'],
+                'config' : self.sea_config, 
+                'writter' : None,
+                'max_epochs' : 0,
+                'multi_gpu' : False,
+            }
+            self.sea_net = sea.SEATrain(**sea_config).to(self.device)
+            self.sea_net.eval()
+
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.model.sac_network.actor.load_state_dict(checkpoint['actor'])
@@ -217,6 +288,9 @@ class SACPlayer(BasePlayer):
         self.model.sac_network.critic_target.load_state_dict(checkpoint['critic_target'])
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
+
+        if self.use_sea:
+            self.sea_net.load_state_dict(checkpoint['sea_net'])
 
         env_state = checkpoint.get('env_state', None)
         if self.env is not None and env_state is not None:
