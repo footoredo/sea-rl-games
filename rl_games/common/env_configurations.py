@@ -61,6 +61,24 @@ def create_default_gym_env(**kwargs):
         env = wrappers.LimitStepsWrapper(env)
     return env
 
+def create_sea_gym_env(**kwargs):
+    frames = kwargs.pop('frames', 1)
+    name = kwargs.pop('name')
+    is_procgen = kwargs.pop('procgen', False)
+    limit_steps = kwargs.pop('limit_steps', False)
+    env = gym.make(name, **kwargs)
+
+    if frames > 1:
+        if is_procgen:
+            env = wrappers.ProcgenStack(env, frames, True)
+        else:
+            env = wrappers.FrameStack(env, frames, False)
+    if limit_steps:
+        env = wrappers.LimitStepsWrapper(env)
+    if name.startswith('HalfCheetah'):
+        env = wrappers.HalfCheetahAchievementWrapper(env)
+    return env
+
 def create_goal_gym_env(**kwargs):
     frames = kwargs.pop('frames', 1)
     name = kwargs.pop('name')
@@ -374,6 +392,10 @@ configurations = {
     },
     'openai_gym' : {
         'env_creator' : lambda **kwargs : create_default_gym_env(**kwargs),
+        'vecenv_type' : 'RAY'
+    },
+    'sea_gym' : {
+        'env_creator' : lambda **kwargs : create_sea_gym_env(**kwargs),
         'vecenv_type' : 'RAY'
     },
     'openai_robot_gym' : {

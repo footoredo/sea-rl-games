@@ -261,7 +261,7 @@ class A2CBuilder(NetworkBuilder):
                     if self.rnn_ln:
                         self.layer_norm = torch.nn.LayerNorm(self.rnn_units)
 
-            print(in_mlp_shape)
+            # print(in_mlp_shape)
 
             mlp_args = {
                 'input_size' : in_mlp_shape, 
@@ -278,10 +278,10 @@ class A2CBuilder(NetworkBuilder):
 
             if self.use_sea:
                 sea_mlp_args = mlp_args
-                sea_mlp_args['units'] = [256, 256]
+                sea_mlp_args['units'] = self.units
                 sea_mlp_args['input_size'] = self.units[-1] + actions_num
                 self.sea_mlp = self._build_mlp(**sea_mlp_args)
-                self.sea_pred = self._build_value_layer(256, 1)
+                self.sea_pred = self._build_value_layer(self.units[-1], 1)
             else:
 
                 self.value = self._build_value_layer(out_size, self.value_size)
@@ -362,6 +362,8 @@ class A2CBuilder(NetworkBuilder):
             obs = input_dict['obs']
             next_obs = input_dict['next_obs']
             action = input_dict['action']
+            # print(torch.square((obs - next_obs)).sum())
+            # print(torch.mean(obs), torch.std(obs))
             obs_embed = self.get_obs_embedding(obs, do_mlp=True)[1]
             next_obs_embed = self.get_obs_embedding(next_obs, do_mlp=True)[1]
             num_units = obs_embed.shape[-1] // 2
@@ -371,10 +373,11 @@ class A2CBuilder(NetworkBuilder):
             next_obs_embed = next_obs_embed[:, num_units:]
             # obs_embed = torch.zeros_like(obs_embed)
             # action = torch.zeros_like(action)
-            sea_input = torch.cat((obs_embed, next_obs_embed, action), 1)
+            full_obs_embed = torch.cat((obs_embed, next_obs_embed), 1)
+            sea_input = torch.cat((full_obs_embed, action), 1)
             # sea_input = torch.zeros_like(sea_input)
             # sea_input[:, 0] = next_obs[:, 0]
-            embed = self.sea_mlp(sea_input)
+            embed = self.sea_mlp(sea_input) + full_obs_embed
             out = self.sea_pred(embed)
             return embed, out
 

@@ -8,6 +8,7 @@ from collections import deque
 import gym
 from gym import spaces
 from copy import copy
+import bisect
 
 
 
@@ -603,6 +604,17 @@ class ImpalaEnvWrapper(gym.Wrapper):
             'last_action': 0
         }
         return obs
+
+
+class HalfCheetahAchievementWrapper(gym.Wrapper):
+    TARGET_DISTANCES = [1 * 1.5 ** i for i in range(50)]
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        x_pos = info['x_position']
+        pos = bisect.bisect(HalfCheetahAchievementWrapper.TARGET_DISTANCES, x_pos)
+        info['unlocked'] = [f'target-{i}' for i in range(pos)]
+        return obs, reward, done, info
 
 
 class MaskVelocityWrapper(gym.ObservationWrapper):

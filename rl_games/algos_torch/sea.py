@@ -36,8 +36,8 @@ class SEATrain(nn.Module):
         self.multi_gpu = multi_gpu
         self.truncate_grads = config.get('truncate_grads', False)
         self.config = config
-        # self.normalize_input = config['normalize_input']
-        self.normalize_input = False
+        self.normalize_input = config['normalize_input']
+        # self.normalize_input = False
 
         state_config = {
             'value_size' : value_size,
@@ -71,7 +71,8 @@ class SEATrain(nn.Module):
 
         self.writter = writter
         self.weight_decay = config.get('weight_decay', 0.0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), float(self.lr), eps=1e-08, weight_decay=self.weight_decay)
+        # self.optimizer = torch.optim.Adam(self.model.parameters(), float(self.lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4, eps=1e-5)
         self.frame = 0
         self.epoch_num = 0
         self.running_mean_std = None
@@ -79,6 +80,10 @@ class SEATrain(nn.Module):
         self.truncate_grads = config.get('truncate_grads', False)
         self.e_clip = config.get('e_clip', 0.2)
         self.truncate_grad = self.config.get('truncate_grads', False)
+
+        self.contrast_tau = config.get('contrast_tau', 2)
+        self.contrast_coef = config.get('contrast_coef', 1.0)
+        print('contrast_coef:', self.contrast_coef)
 
         self.centroids = None
 
@@ -150,45 +155,54 @@ class SEATrain(nn.Module):
         batch_size = self.minibatch_size
         print(achievement_buffer.size, batch_size, self.writter)
         # if achievement_buffer.size >= batch_size:
+        # if achievement_buffer.size >= 1:
         if achievement_buffer.size >= batch_size // 4:
             contrast_loss, pred_loss = 0, 0
             self.train()
             for _ in range(self.mini_epoch):
                 a_obses, a_actions, a_next_obses, valids = achievement_buffer.sample(batch_size)
-                s_obses, s_actions, s_next_obses, rewards = sea_buffer.sample(batch_size * a_obses.shape[1])
+                # s_obses, s_actions, s_next_obses, rewards = sea_buffer.sample(batch_size * a_obses.shape[1])
 
                 # v = rewards.shape[0]
                 # for i in range(v):
                 #     if rewards[i] > 0.1:
                 #         print(s_obses[i, 0], s_next_obses[i, 0], rewards[i])
 
+                # _contrast_loss, _pred_loss = self.calc_gradients({
+                #     'obs': a_obses,
+                #     'action': a_actions,
+                #     'next_obs': a_next_obses,
+                #     'valid': valids
+                # }, {
+                #     'obs': s_obses,
+                #     'action': s_actions,
+                #     'next_obs': s_next_obses,
+                #     'reward': rewards
+                # })
                 _contrast_loss, _pred_loss = self.calc_gradients({
                     'obs': a_obses,
                     'action': a_actions,
                     'next_obs': a_next_obses,
                     'valid': valids
-                }, {
-                    'obs': s_obses,
-                    'action': s_actions,
-                    'next_obs': s_next_obses,
-                    'reward': rewards
-                })
+                }, None)
                 contrast_loss += _contrast_loss
                 pred_loss += _pred_loss
 
                 if self.normalize_input:
                     self.model.running_mean_std.eval()  # don't need to update statstics more than one miniepoch
 
+                self.epoch_num += 1
+                self.lr, _ = self.scheduler.update(self.lr, 0, self.epoch_num, 0, 0)
+                self.update_lr(self.lr)
+
+                if self.writter != None:
+                    self.writter.add_scalar('losses/sea_contrast_loss', _contrast_loss, self.epoch_num)
+                    self.writter.add_scalar('losses/sea_pred_loss', _pred_loss, self.epoch_num)
+                    self.writter.add_scalar('info/sea_lr', self.lr, self.epoch_num)
+
             avg_contrast_loss = contrast_loss / self.mini_epoch
             avg_pred_loss = pred_loss / self.mini_epoch
 
-            self.epoch_num += 1
-            self.lr, _ = self.scheduler.update(self.lr, 0, self.epoch_num, 0, 0)
-            self.update_lr(self.lr)
-            if self.writter != None:
-                self.writter.add_scalar('losses/sea_contrast_loss', avg_contrast_loss, frame)
-                self.writter.add_scalar('losses/sea_pred_loss', avg_pred_loss, frame)
-                self.writter.add_scalar('info/sea_lr', self.lr, frame)
             return avg_contrast_loss, avg_pred_loss
         else:
             return 0, 0
@@ -226,7 +240,7 @@ class SEATrain(nn.Module):
         # print(torch.square(embed_dis - embed_dis_2).sum())
         embed_dis = embed_dis * mat_valid_masks
         # kernel_dis = torch.exp(-embed_dis / (embed_dis.max() + 1e-6) * 4)
-        kernel_dis = torch.exp(-embed_dis / (embed_dis.max()) * 2)
+        kernel_dis = torch.exp(-embed_dis / (embed_dis.max()) * self.contrast_tau)
         kernel_dis = kernel_dis * mat_valid_masks + torch.eye(L, device=kernel_dis.device).unsqueeze(0) * (1 - mat_valid_masks)
         # print(kernel_dis[0])
         sea_losses = -torch.det(kernel_dis)
@@ -310,8 +324,11 @@ class SEATrain(nn.Module):
 
     def calc_gradients(self, contrast_batch, pred_batch):
         contrast_loss = self._calc_contrast_loss(contrast_batch)
-        pred_loss = self._calc_pred_loss(pred_batch)
-        loss = contrast_loss + pred_loss * 0
+        if pred_batch is None:
+            pred_loss = 0
+        else:
+            pred_loss = self._calc_pred_loss(pred_batch)
+        loss = contrast_loss * self.contrast_coef + pred_loss * 0
         
         if self.multi_gpu:
             self.optimizer.zero_grad()

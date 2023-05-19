@@ -71,11 +71,14 @@ class ObjectiveSelector:
     
 
 class RandomObjectiveSelector(ObjectiveSelector):
+    def set_num_objectives(self, num_objectives):
+        self._num_objectives = num_objectives
+    
     def get_init_objective(self):
-        return self.np_random.randint(self.num_objectives)
+        return self.np_random.randint(self._num_objectives)
     
     def get_next_objective(self, completed, objective, step_completed):
-        return self.np_random.randint(self.num_objectives)
+        return self.np_random.randint(self._num_objectives), len(step_completed), False
     
 
 class SequentialObjectiveSelector(ObjectiveSelector):
@@ -297,9 +300,9 @@ class SEAVecWrapper(IVecEnvWrapper):
         # self.is_list_info = type(info) == list
 
         step_completed = [list(info[i]["unlocked"]) for i in range(self.batch_size)]
-        for i in range(self.batch_size):
-            if len(step_completed[i]) > 0:
-                print(step_completed[i])
+        # for i in range(self.batch_size):
+        #     if len(step_completed[i]) > 0:
+        #         print(step_completed[i])
 
         # print(step_completed)
 
@@ -334,6 +337,7 @@ class SEAVecWrapper(IVecEnvWrapper):
             [{
                 "env_reward": reward[i],
                 "env_is_done": is_done[i],
+                "step_completed": step_completed[i],
                 **info[i]
             } for i in range(self.batch_size)]
 
@@ -346,8 +350,10 @@ class SEAWrapper(gym.Wrapper):
         self.np_random = np.random.RandomState(1)
         self.objective_embed_book = np.random.randn(MAX_OBJECTIVES, self.objective_dim)
         print(self.objective_embed_book[:5, :5])
-        self.objective_selector = SequentialObjectiveSelector()
-        self.objective_selector.fill_objectives(50)
+        # self.objective_selector = SequentialObjectiveSelector()
+        # self.objective_selector.fill_objectives(50)
+        self.objective_selector = RandomObjectiveSelector()
+        self.objective_selector.set_num_objectives(8)
 
         self.target_distances = TARGET_DISTANCES
 
@@ -376,12 +382,12 @@ class SEAWrapper(gym.Wrapper):
         return bisect.bisect(self.target_distances, x_pos)
     
     def _post_obs(self, obs, achv):
-        obs[0] = self._calc_pos(obs)
+        # obs[0] = self._calc_pos(obs)
         # obs[0] = int(achv)
         return obs
     
     def _add_objective(self, obs):
-        num_objectives = self.objective_selector.num_objectives
+        num_objectives = self.objective_selector._num_objectives
         # print(num_objectives)
         objective_oh = np.zeros((1, num_objectives), dtype=float)
         objective_oh[0, self.objective] = 1  # one_hot
@@ -406,12 +412,14 @@ class SEAWrapper(gym.Wrapper):
     def step(self, actions):
         next_obs, reward, is_done, info = self.env.step(actions)
 
-        x_pos = info['x_position']
-        pos = bisect.bisect(self.target_distances, x_pos)
+        # x_pos = info['x_position']
+        # pos = bisect.bisect(self.target_distances, x_pos)
         # pos = min(pos, 5)
         # step_completed = [f'target-{i}' for i in range(pos)]
-        step_completed = list(range(pos))
+        # step_completed = list(range(pos))
         # print(next_obs[0], x_pos)
+
+        step_completed = list(info['unlocked'])
 
         step_completed = self.objective_selector.get_step_completed([step_completed])
         # obj_reward = len(step_completed[0])
@@ -421,7 +429,13 @@ class SEAWrapper(gym.Wrapper):
 
         # print(self.objective, obj_reward, step_completed)
 
-        return self._add_objective(self._post_obs(next_obs, len(step_completed) > 0)), obj_reward[0] + 0.000 * info["reward_ctrl"], is_done, info
+        # return self._add_objective(self._post_obs(next_obs, len(step_completed) > 0)), obj_reward[0] + 0.000 * info["reward_ctrl"], is_done, info
+        return self._add_objective(self._post_obs(next_obs, len(step_completed) > 0)), obj_reward[0], is_done, {
+            "env_reward": reward,
+            "env_is_done": is_done,
+            "step_completed": step_completed[0],
+            **info
+        }
 
 
 class SEAVecWrapperOld(IVecEnvWrapper):

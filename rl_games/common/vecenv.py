@@ -8,10 +8,15 @@ import gym
 import random
 from time import sleep
 import torch
+import time
 
+@ray.remote
 class RayWorker:
-    def __init__(self, config_name, config):
+    def __init__(self, worker_id, config_name, config):
         self.env = configurations[config_name]['env_creator'](**config)
+        self.worker_id = worker_id
+        self.time = 0
+        self.cnt = 0
 
     def _obs_to_fp32(self, obs):
         if isinstance(obs, dict):
@@ -29,6 +34,7 @@ class RayWorker:
         return obs
 
     def step(self, action):
+        t0 = time.time()
         next_state, reward, is_done, info = self.env.step(action)
         
         if np.isscalar(is_done):
@@ -38,6 +44,10 @@ class RayWorker:
         if episode_done:
             next_state = self.reset()
         next_state = self._obs_to_fp32(next_state)
+        self.time += time.time() - t0
+        self.cnt += 1
+        # if self.cnt % 10 == 0 and self.worker_id == 0:
+        #     print(self.time / self.cnt)
         return next_state, reward, is_done, info
 
     def seed(self, seed):
@@ -102,8 +112,9 @@ class RayVecEnv(IVecEnv):
         self.num_actors = num_actors
         self.use_torch = False
         self.seed = kwargs.pop('seed', None)
-        self.remote_worker = ray.remote(RayWorker)
-        self.workers = [self.remote_worker.remote(self.config_name, kwargs) for i in range(self.num_actors)]
+        # self.remote_worker = ray.remote(RayWorker)
+        # print(self.num_actors, 'RayVecEnv', self.config_name)
+        self.workers = [RayWorker.remote(i, self.config_name, kwargs) for i in range(self.num_actors)]
 
         if self.seed is not None:
             seeds = range(self.seed, self.seed + self.num_actors)
@@ -127,8 +138,14 @@ class RayVecEnv(IVecEnv):
             self.concat_func = np.stack
         else:
             self.concat_func = np.concatenate
+
+        self.pal_time = 0
+        self.res_time = 0
+
+        self.cnt = 0
     
     def step(self, actions):
+        t0 = time.time()
         newobs, newstates, newrewards, newdones, newinfos = [], [], [], [], []
         res_obs = []
         if self.num_agents == 1:
@@ -149,6 +166,9 @@ class RayVecEnv(IVecEnv):
             newrewards.append(crewards)
             newdones.append(cdones)
             newinfos.append(cinfos)
+        
+        t1 = time.time()
+        self.pal_time += t1 - t0
 
         if self.obs_type_dict:
             ret_obs = dicts_to_dict_with_arrays(newobs, self.num_agents == 1)
@@ -166,6 +186,14 @@ class RayVecEnv(IVecEnv):
             ret_obs = newobsdict
         if self.concat_infos:
             newinfos = dicts_to_dict_with_arrays(newinfos, False)
+
+        t2 = time.time()
+        self.res_time += t2 - t1
+
+        self.cnt += 1
+        # if self.cnt % 10 == 0:
+        #     print(self.pal_time / self.cnt, self.res_time / self.cnt)
+
         return ret_obs, self.concat_func(newrewards), self.concat_func(newdones), newinfos
 
     def get_env_info(self):

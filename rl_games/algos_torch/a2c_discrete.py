@@ -178,8 +178,9 @@ class DiscreteA2CAgent(a2c_common.DiscreteA2CBase):
                 for param in self.model.parameters():
                     param.grad = None
 
-        self.scaler.scale(loss).backward()
-        self.trancate_gradients_and_step()
+        if not self.no_train_actor_critic:
+            self.scaler.scale(loss).backward()
+            self.trancate_gradients_and_step()
 
         with torch.no_grad():
             kl_dist = 0.5 * ((old_action_log_probs_batch - action_log_probs)**2)

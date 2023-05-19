@@ -221,6 +221,7 @@ class BasePlayer(object):
         if self.use_sea:
             sea_embeds = []
             sea_preds = []
+            sea_achvs = []
 
         need_init_rnn = self.is_rnn
         for _ in range(n_games):
@@ -243,16 +244,19 @@ class BasePlayer(object):
             if self.use_sea:
                 batch_sea_embeds = [[] for _ in range(batch_size)]
                 batch_sea_preds = [[] for _ in range(batch_size)]
+                batch_sea_achvs = [[] for _ in range(batch_size)]
 
             for n in range(self.max_steps):
+                if self.use_sea:
+                    last_obses = obses['observation'].clone()
+                    # print(last_obses.shape, self.has_batch_dimension)
+
                 if has_masks:
                     masks = self.env.get_action_mask()
                     action = self.get_masked_action(
                         obses, masks, is_deterministic)
                 else:
                     action = self.get_action(obses, is_deterministic)
-
-                last_obses = obses
 
                 obses, r, done, info = self.env_step(self.env, action)
                 cr += r
@@ -262,13 +266,14 @@ class BasePlayer(object):
                     for i in range(batch_size):
                         if r[i] > 0.1:
                             if self.has_batch_dimension:
-                                obs = last_obses['observation'][i: i + 1]
+                                obs = last_obses[i: i + 1]
                                 next_obs = obses['observation'][i: i + 1]
                                 _action = action[i: i + 1]
                             else:
-                                obs = last_obses['observation'].unsqueeze(0)
+                                obs = last_obses.unsqueeze(0)
                                 next_obs = obses['observation'].unsqueeze(0)
                                 _action = action.unsqueeze(0)
+                            # print(obs.shape, next_obs.shape)
                             sea_embed, sea_pred = self.sea_net.get_sea_outputs(
                                 obs=self._preproc_obs(obs),
                                 next_obs=self._preproc_obs(next_obs),
@@ -278,12 +283,18 @@ class BasePlayer(object):
                             sea_pred = sea_pred[0]
                             batch_sea_embeds[i].append(sea_embed.detach().cpu().numpy())
                             batch_sea_preds[i].append(sea_pred.detach().cpu().numpy())
+                            if self.has_batch_dimension:
+                                batch_sea_achvs[i].append(info[i]['step_completed'])
+                            else:
+                                batch_sea_achvs[i].append(info['step_completed'])
                         if done[i]:
                             if len(batch_sea_embeds[i]) > 0:
                                 sea_embeds.append(batch_sea_embeds[i])
                                 sea_preds.append(batch_sea_preds[i])
+                                sea_achvs.append(batch_sea_achvs[i])
                             batch_sea_embeds[i] = []
                             batch_sea_preds[i] = []
+                            batch_sea_achvs[i] = []
 
                 if render:
                     self.env.render(mode='human')
@@ -336,6 +347,7 @@ class BasePlayer(object):
 
         self.sea_embeds = sea_embeds
         self.sea_preds = sea_preds
+        self.sea_achvs = sea_achvs
 
         # print(sum_rewards)
         if print_game_res:

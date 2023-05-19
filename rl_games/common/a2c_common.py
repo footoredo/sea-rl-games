@@ -84,6 +84,9 @@ class A2CBase(BaseAlgorithm):
         self.use_sea = config.get('use_sea', False)
         self.sea_config = config.get('sea_config', {})
         self.sea_coef = self.sea_config.get('coef', 1.)
+        self.no_train_actor_critic = config.get('no_train_actor_critic', False)
+        self.no_load_sea = config.get('no_load_sea', False)
+        self.only_load_weights = config.get('only_load_weights', False)
         self.algo_observer = config['features']['observer']
         self.algo_observer.before_init(base_name, config, self.experiment_name)
         self.load_networks(params)
@@ -149,6 +152,7 @@ class A2CBase(BaseAlgorithm):
 
         self.self_play = config.get('self_play', False)
         self.save_freq = config.get('save_frequency', 0)
+        print('save_freq', self.save_freq)
         self.save_best_after = config.get('save_best_after', 100)
         self.print_stats = config.get('print_stats', True)
         self.rnn_states = None
@@ -354,14 +358,17 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('performance/rl_update_time', update_time, frame)
         self.writer.add_scalar('performance/step_inference_time', play_time, frame)
         self.writer.add_scalar('performance/step_time', step_time, frame)
-        self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
-        self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
-                
-        self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
-        self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
-        self.writer.add_scalar('info/lr_mul', lr_mul, frame)
-        self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
-        self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
+
+        if not self.no_train_actor_critic:
+            self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
+            self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
+                    
+            self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
+            self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
+            self.writer.add_scalar('info/lr_mul', lr_mul, frame)
+            self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
+            self.writer.add_scalar('info/kl', torch_ext.mean_list(kls).item(), frame)
+
         self.writer.add_scalar('info/epochs', epoch_num, frame)
         self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
@@ -460,6 +467,11 @@ class A2CBase(BaseAlgorithm):
                                         self.env_info["action_space"].shape, 
                                         device=self.ppo_device,
                                         **self.sea_config["achievement_buffer_config"])
+            self.save_achievement_buffer = self.sea_config.get('save_achievement_buffer', False)
+            achievement_buffer_checkpoint = self.sea_config.get('achievement_buffer_checkpoint', None)
+            if achievement_buffer_checkpoint:
+                self.achievement_buffer.restore(achievement_buffer_checkpoint)
+            self.sea_train = self.sea_config.get('train', True)
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
@@ -607,7 +619,8 @@ class A2CBase(BaseAlgorithm):
         return self.central_value_net.train_net()
     
     def train_sea(self):
-        return self.sea_net.train_net(self.achievement_buffer, self.sea_buffer, self.frame)
+        if self.sea_train:
+            return self.sea_net.train_net(self.achievement_buffer, self.sea_buffer, self.frame)
 
     def get_full_state_weights(self):
         state = self.get_weights()
@@ -631,18 +644,27 @@ class A2CBase(BaseAlgorithm):
 
     def set_full_state_weights(self, weights):
         self.set_weights(weights)
-        self.epoch_num = weights['epoch'] # frames as well?
+
+        if not self.only_load_weights:
+            self.epoch_num = weights['epoch'] # frames as well?
+            self.frame = weights.get('frame', 0)
+            self.optimizer.load_state_dict(weights['optimizer'])
+            self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+
+            env_state = weights.get('env_state', None)
+
+            if self.vec_env is not None:
+                self.vec_env.set_env_state(env_state)
+
         if self.has_central_value:
             self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
 
-        self.optimizer.load_state_dict(weights['optimizer'])
-        self.frame = weights.get('frame', 0)
-        self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+        if self.use_sea and not self.no_load_sea:
+            if 'sea_net' not in weights:
+                print('no sea_net weights found in checkpoint!')
+            else:
+                self.sea_net.load_state_dict(weights['sea_net'])
 
-        env_state = weights.get('env_state', None)
-
-        if self.vec_env is not None:
-            self.vec_env.set_env_state(env_state)
 
     def get_weights(self):
         state = self.get_stats_weights()
@@ -709,7 +731,8 @@ class A2CBase(BaseAlgorithm):
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
-            last_obs = self.obs['obs']['observation']
+            if self.use_sea:
+                last_obs = self.obs['obs']['observation'].clone()
 
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
@@ -805,7 +828,8 @@ class A2CBase(BaseAlgorithm):
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones.byte())
 
-            last_obs = self.obs['obs']['observation'].copy()
+            if self.use_sea:
+                last_obs = self.obs['obs']['observation'].clone()
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
@@ -952,26 +976,30 @@ class DiscreteA2CBase(A2CBase):
         if self.use_sea:
             self.train_sea()
 
-        for mini_ep in range(0, self.mini_epochs_num):
-            ep_kls = []
-            for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul = self.train_actor_critic(self.dataset[i])
-                a_losses.append(a_loss)
-                c_losses.append(c_loss)
-                ep_kls.append(kl)
-                entropies.append(entropy)
+        if not self.no_train_actor_critic:
+            for mini_ep in range(0, self.mini_epochs_num):
+                ep_kls = []
+                for i in range(len(self.dataset)):
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul = self.train_actor_critic(self.dataset[i])
+                    a_losses.append(a_loss)
+                    c_losses.append(c_loss)
+                    ep_kls.append(kl)
+                    entropies.append(entropy)
 
-            av_kls = torch_ext.mean_list(ep_kls)
-            if self.multi_gpu:
-                dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
-                av_kls /= self.rank_size
+                av_kls = torch_ext.mean_list(ep_kls)
+                if self.multi_gpu:
+                    dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
+                    av_kls /= self.rank_size
 
-            self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-            self.update_lr(self.last_lr)
-            kls.append(av_kls)
-            self.diagnostics.mini_epoch(self, mini_ep)
-            if self.normalize_input:
-                self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
+                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+                self.update_lr(self.last_lr)
+                kls.append(av_kls)
+                self.diagnostics.mini_epoch(self, mini_ep)
+                if self.normalize_input:
+                    self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
+        else:
+            last_lr = 0
+            lr_mul = 0
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
@@ -1102,20 +1130,25 @@ class DiscreteA2CBase(A2CBase):
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
                     self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
 
-                    if self.use_sea and self.game_achv_rewards.current_size > 0:
-                        mean_achv_rewards = self.game_achv_rewards.get_mean()
-                        mean_env_rewards = self.game_env_rewards.get_mean()
-                        mean_true_lengths = self.game_true_lengths.get_mean()
-                        self.writer.add_scalar('sea/achv_reward/step', mean_achv_rewards[0], frame)
-                        self.writer.add_scalar('sea/achv_reward/iter', mean_achv_rewards[0], epoch_num)
-                        self.writer.add_scalar('sea/achv_reward/time', mean_achv_rewards[0], total_time)
-                        self.writer.add_scalar('sea/env_reward/step', mean_env_rewards[0], frame)
-                        self.writer.add_scalar('sea/env_reward/iter', mean_env_rewards[0], epoch_num)
-                        self.writer.add_scalar('sea/env_reward/time', mean_env_rewards[0], total_time)
-                        self.writer.add_scalar('sea/true_episode_lengths/step', mean_true_lengths, frame)
-                        self.writer.add_scalar('sea/true_episode_lengths/iter', mean_true_lengths, epoch_num)
-                        self.writer.add_scalar('sea/true_episode_lengths/time', mean_true_lengths, total_time)
-                        self.mean_rewards = mean_achv_rewards[0]
+                    if self.use_sea:
+                        if self.game_achv_rewards.current_size > 0:
+                            mean_achv_rewards = self.game_achv_rewards.get_mean()
+                            mean_env_rewards = self.game_env_rewards.get_mean()
+                            mean_true_lengths = self.game_true_lengths.get_mean()
+                            self.writer.add_scalar('sea/achv_reward/step', mean_achv_rewards[0], frame)
+                            self.writer.add_scalar('sea/achv_reward/iter', mean_achv_rewards[0], epoch_num)
+                            self.writer.add_scalar('sea/achv_reward/time', mean_achv_rewards[0], total_time)
+                            self.writer.add_scalar('sea/env_reward/step', mean_env_rewards[0], frame)
+                            self.writer.add_scalar('sea/env_reward/iter', mean_env_rewards[0], epoch_num)
+                            self.writer.add_scalar('sea/env_reward/time', mean_env_rewards[0], total_time)
+                            self.writer.add_scalar('sea/true_episode_lengths/step', mean_true_lengths, frame)
+                            self.writer.add_scalar('sea/true_episode_lengths/iter', mean_true_lengths, epoch_num)
+                            self.writer.add_scalar('sea/true_episode_lengths/time', mean_true_lengths, total_time)
+                            self.mean_rewards = mean_achv_rewards[0]
+                    else:
+                        self.writer.add_scalar('sea/env_reward/step', mean_rewards[0], frame)
+                        self.writer.add_scalar('sea/env_reward/iter', mean_rewards[0], epoch_num)
+                        self.writer.add_scalar('sea/env_reward/time', mean_rewards[0], total_time)
 
                     if self.has_self_play_config:
                         self.self_play_manager.update(self)
@@ -1233,38 +1266,42 @@ class ContinuousA2CBase(A2CBase):
         entropies = []
         kls = []
 
-        for mini_ep in range(0, self.mini_epochs_num):
-            ep_kls = []
-            for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
-                a_losses.append(a_loss)
-                c_losses.append(c_loss)
-                ep_kls.append(kl)
-                entropies.append(entropy)
-                if self.bounds_loss_coef is not None:
-                    b_losses.append(b_loss)
+        if not self.no_train_actor_critic:
+            for mini_ep in range(0, self.mini_epochs_num):
+                ep_kls = []
+                for i in range(len(self.dataset)):
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                    a_losses.append(a_loss)
+                    c_losses.append(c_loss)
+                    ep_kls.append(kl)
+                    entropies.append(entropy)
+                    if self.bounds_loss_coef is not None:
+                        b_losses.append(b_loss)
 
-                self.dataset.update_mu_sigma(cmu, csigma)
-                if self.schedule_type == 'legacy':
-                    av_kls = kl
-                    if self.multi_gpu:
-                        dist.all_reduce(kl, op=dist.ReduceOp.SUM)
-                        av_kls /= self.rank_size
+                    self.dataset.update_mu_sigma(cmu, csigma)
+                    if self.schedule_type == 'legacy':
+                        av_kls = kl
+                        if self.multi_gpu:
+                            dist.all_reduce(kl, op=dist.ReduceOp.SUM)
+                            av_kls /= self.rank_size
+                        self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+                        self.update_lr(self.last_lr)
+
+                av_kls = torch_ext.mean_list(ep_kls)
+                if self.multi_gpu:
+                    dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
+                    av_kls /= self.rank_size
+                if self.schedule_type == 'standard':
                     self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
                     self.update_lr(self.last_lr)
 
-            av_kls = torch_ext.mean_list(ep_kls)
-            if self.multi_gpu:
-                dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
-                av_kls /= self.rank_size
-            if self.schedule_type == 'standard':
-                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                self.update_lr(self.last_lr)
-
-            kls.append(av_kls)
-            self.diagnostics.mini_epoch(self, mini_ep)
-            if self.normalize_input:
-                self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
+                kls.append(av_kls)
+                self.diagnostics.mini_epoch(self, mini_ep)
+                if self.normalize_input:
+                    self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
+        else:
+            last_lr = 0
+            lr_mul = 0
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
@@ -1398,6 +1435,26 @@ class ContinuousA2CBase(A2CBase):
                     self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
                     self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
 
+                    if self.use_sea:
+                        if self.game_achv_rewards.current_size > 0:
+                            mean_achv_rewards = self.game_achv_rewards.get_mean()
+                            mean_env_rewards = self.game_env_rewards.get_mean()
+                            mean_true_lengths = self.game_true_lengths.get_mean()
+                            self.writer.add_scalar('sea/achv_reward/step', mean_achv_rewards[0], frame)
+                            self.writer.add_scalar('sea/achv_reward/iter', mean_achv_rewards[0], epoch_num)
+                            self.writer.add_scalar('sea/achv_reward/time', mean_achv_rewards[0], total_time)
+                            self.writer.add_scalar('sea/env_reward/step', mean_env_rewards[0], frame)
+                            self.writer.add_scalar('sea/env_reward/iter', mean_env_rewards[0], epoch_num)
+                            self.writer.add_scalar('sea/env_reward/time', mean_env_rewards[0], total_time)
+                            self.writer.add_scalar('sea/true_episode_lengths/step', mean_true_lengths, frame)
+                            self.writer.add_scalar('sea/true_episode_lengths/iter', mean_true_lengths, epoch_num)
+                            self.writer.add_scalar('sea/true_episode_lengths/time', mean_true_lengths, total_time)
+                            self.mean_rewards = mean_achv_rewards[0]
+                    else:
+                        self.writer.add_scalar('sea/env_reward/step', mean_rewards[0], frame)
+                        self.writer.add_scalar('sea/env_reward/iter', mean_rewards[0], epoch_num)
+                        self.writer.add_scalar('sea/env_reward/time', mean_rewards[0], total_time)
+
                     if self.has_self_play_config:
                         self.self_play_manager.update(self)
 
@@ -1444,8 +1501,10 @@ class ContinuousA2CBase(A2CBase):
                 should_exit_t = torch.tensor(should_exit, device=self.device).float()
                 dist.broadcast(should_exit_t, 0)
                 should_exit = should_exit_t.float().item()
+
             if should_exit:
-                return self.last_mean_rewards, epoch_num
+                if self.use_sea and self.save_achievement_buffer:
+                    self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
 
             if should_exit:
                 return self.last_mean_rewards, epoch_num

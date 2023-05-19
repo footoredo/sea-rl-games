@@ -4,6 +4,7 @@ import gym
 import torch
 from rl_games.common.segment_tree import SumSegmentTree, MinSegmentTree
 import torch
+from rl_games.algos_torch import torch_ext
 
 from rl_games.algos_torch.torch_ext import numpy_to_torch_dtype_dict
 
@@ -284,7 +285,7 @@ class VectorizedReplayBuffer:
 
 
 class AchievementBuffer:
-    def __init__(self, batch_size, obs_shape, action_shape, length, capacity, minimum_length, device):
+    def __init__(self, batch_size, obs_shape, action_shape, length, capacity, minimum_length, random_sampling, device):
         """Create Vectorized Replay buffer.
         Parameters
         ----------
@@ -312,7 +313,8 @@ class AchievementBuffer:
         self.length = length
         self.minimum_length = minimum_length
         self.capacity = capacity
-        self.full = False
+        self.random_sampling = random_sampling
+        self.sample_pointer = 0
         # print(self.capacity)
         self.true_size = 0
         self.true_episode_length = [0 for _ in range(batch_size)]
@@ -338,19 +340,23 @@ class AchievementBuffer:
             if self.true_size < self.capacity:
                 idx = self.true_size
             else:
-                idx = np.random.randint(self.true_size + 1)
+                # idx = np.random.randint(self.true_size + 1)
+                idx = self.true_size % self.capacity
             if idx < self.capacity:
                 self.obses[idx][:] = self.tmp_obses[i_batch].detach().clone()
                 self.next_obses[idx][:] = self.tmp_next_obses[i_batch].detach().clone()
                 self.actions[idx][:] = self.tmp_actions[i_batch].detach().clone()
                 self.valids[idx][:] = self.tmp_valids[i_batch].detach().clone()
             self.true_size += 1
-            self.full = self.true_size >= self.capacity
         self.true_episode_length[i_batch] = 0
 
     @property
     def size(self):
         return self.capacity if self.full else self.true_size
+    
+    @property
+    def full(self):
+        return self.true_size >= self.capacity
 
     def sample(self, batch_size):
         """Sample a batch of experiences.
@@ -374,19 +380,37 @@ class AchievementBuffer:
             inverse of whether the episode ended at this tuple of (observation, action) or not, specifically exlcuding maximum episode steps
         """
 
-        idxs = torch.randint(0,
-                            self.size, 
-                            (batch_size,), device=self.device)
+        if self.random_sampling:
+            idxs = torch.randint(0,
+                                self.size, 
+                                (batch_size,), device=self.device)
+        else:
+            idxs = list(range(self.sample_pointer, min(self.size, self.sample_pointer + batch_size)))
+            if self.size < self.sample_pointer + batch_size:
+                idxs += list(range(self.sample_pointer + batch_size - self.size))
+            assert len(idxs) == batch_size
+            self.sample_pointer = (self.sample_pointer + batch_size) % self.size
+            idxs = torch.IntTensor(idxs)
         obses = self.obses[idxs].detach().clone()
         actions = self.actions[idxs].detach().clone()
         next_obses = self.next_obses[idxs].detach().clone()
         valid = self.valids[idxs].detach().clone()
 
         return obses, actions, next_obses, valid
+    
+    def save(self, filename):
+        print(f'saving achievement buffer with size {self.size} and true_size {self.true_size}')
+        states = (self.true_size, self.obses[:self.true_size], self.next_obses[:self.true_size], self.actions[:self.true_size], self.valids[:self.true_size])
+        torch_ext.save_checkpoint(filename, states)
 
+    def restore(self, filename):
+        states = torch_ext.load_checkpoint(filename)
+        self.true_size = states[0]
+        print(f'restored achievement buffer with true_size {self.true_size}')
+        self.obses[:self.true_size], self.next_obses[:self.true_size], self.actions[:self.true_size], self.valids[:self.true_size] = states[1:]
 
 class SEABuffer:
-    def __init__(self, obs_shape, action_shape, length, capacity, minimum_length, device):
+    def __init__(self, obs_shape, action_shape, length, capacity, minimum_length, random_sampling, device):
         """Create Vectorized Replay buffer.
         Parameters
         ----------
