@@ -8,7 +8,11 @@ import gym
 from gym.wrappers import FlattenObservation, FilterObservation
 import numpy as np
 import math
-import crafter
+
+try:
+    import crafter
+except ModuleNotFoundError:
+    pass
 
 
 
