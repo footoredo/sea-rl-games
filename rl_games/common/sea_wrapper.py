@@ -295,9 +295,21 @@ class SEAVecWrapper(IVecEnvWrapper):
         self.objective = self.objective_selector.reset(self.batch_size)
         return self._add_objective(self._post_obs(obs, [0] * self.batch_size))
     
+    def _convert_to_list_info(self, info):
+        if type(info) == list:
+            return info
+        else:
+            infos = [dict() for _ in range(self.batch_size)]
+            for k, v in info.items():
+                if type(v) == list and len(v) == self.batch_size:
+                    for i in range(self.batch_size):
+                        infos[i][k] = v[i]
+            return infos
+    
     def step(self, actions):
         next_obs, reward, is_done, info = self.env.step(actions)
         # self.is_list_info = type(info) == list
+        info = self._convert_to_list_info(info)
 
         step_completed = [list(info[i]["unlocked"]) for i in range(self.batch_size)]
         # for i in range(self.batch_size):
