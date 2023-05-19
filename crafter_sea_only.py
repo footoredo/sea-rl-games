@@ -25,7 +25,7 @@ def save():
    
    config = yaml.safe_load(open('rl_games/configs/ppo_crafter.yaml'))
    config['params']['config']['full_experiment_name'] = 'crafter_save'
-   config['params']['config']['max_epochs'] = 100
+   config['params']['config']['max_epochs'] = 1
    config['params']['config']['save_best_after'] = 100
    config['params']['config']['horizon_length'] = 256
    config['params']['config']['num_actors'] = 32

@@ -1199,6 +1199,10 @@ class DiscreteA2CBase(A2CBase):
                 should_exit = should_exit_t.bool().item()
 
             if should_exit:
+                if self.use_sea and self.save_achievement_buffer:
+                    self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
+
+            if should_exit:
                 return self.last_mean_rewards, epoch_num
 
 
