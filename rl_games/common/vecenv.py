@@ -250,8 +250,7 @@ def create_vec_env(config_name, num_actors, use_sea=False, sea_config={}, **kwar
     vec_env_name = configurations[config_name]['vecenv_type']
     vecenv = vecenv_config[vec_env_name](config_name, num_actors, **kwargs)
     if use_sea:
-        objective_dim = sea_config["objective_dim"]
-        vecenv = SEAVecWrapper(vecenv, objective_dim=objective_dim)
+        vecenv = SEAVecWrapper(vecenv, **sea_config['env_config'])
     return vecenv
 
 register('RAY', lambda config_name, num_actors, **kwargs: RayVecEnv(config_name, num_actors, **kwargs))

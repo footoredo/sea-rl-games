@@ -1,3 +1,4 @@
+from asyncore import write
 import copy
 import os
 
@@ -36,11 +37,34 @@ def swap_and_flatten01(arr):
     s = arr.size()
     return arr.transpose(0, 1).reshape(s[0] * s[1], *s[2:])
 
+
 def rescale_actions(low, high, action):
     d = (high - low) / 2.0
     m = (high + low) / 2.0
     scaled_action = action * d + m
     return scaled_action
+
+
+def get_dict_losses(losses):
+    if len(losses) > 0 and type(losses[0]) == dict:
+        dict_losses = dict()
+        for loss in losses:
+            for key, value in loss.items():
+                if key not in dict_losses:
+                    dict_losses[key] = []
+                dict_losses[key].append(value)
+        return dict_losses
+    else:
+        return losses
+    
+
+def write_dict_stats(writer, name, stats, frame):
+    # print(stats)
+    if type(stats) == dict:
+        for key, _stats in stats.items():
+            writer.add_scalar(f'{name}/{key}', torch_ext.mean_list(_stats).item(), frame)
+    else:
+        writer.add_scalar(f'{name}', torch_ext.mean_list(stats).item(), frame)
 
 
 def print_statistics(print_stats, curr_frames, step_time, step_inference_time, total_time, epoch_num, max_epochs, frame, max_frames):
@@ -81,6 +105,7 @@ class A2CBase(BaseAlgorithm):
             self.experiment_name = config['name'] + pbt_str + datetime.now().strftime("_%d-%H-%M-%S")
 
         self.config = config
+        self.use_rnd = config.get('use_rnd', False)
         self.use_sea = config.get('use_sea', False)
         self.sea_config = config.get('sea_config', {})
         self.sea_coef = self.sea_config.get('coef', 1.)
@@ -219,7 +244,7 @@ class A2CBase(BaseAlgorithm):
         self.gamma = self.config['gamma']
         self.tau = self.config['tau']
 
-        self.games_to_track = self.config.get('games_to_track', 100)
+        self.games_to_track = self.config.get('games_to_track', 2000)
         print('current training device:', self.ppo_device)
         self.game_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
         self.game_shaped_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
@@ -228,6 +253,8 @@ class A2CBase(BaseAlgorithm):
             self.game_achv_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
             self.game_env_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
             self.game_true_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
+            self.achievement_completions = dict()
+            self.objective_rewards = dict()
         self.obs = None
         self.games_num = self.config['minibatch_size'] // self.seq_len # it is used only for current rnn implementation
         self.batch_size = self.horizon_length * self.num_actors * self.num_agents
@@ -323,10 +350,25 @@ class A2CBase(BaseAlgorithm):
                     offset += param.numel()
 
         if self.truncate_grads:
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+            if self.multi_optimizer:
+                for i in range(len(self.optimizers)):
+                    self.scaler.unscale_(self.optimizers[i])
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+            else:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
 
-        self.scaler.step(self.optimizer)
+        if self.multi_optimizer:
+            for i, optimizer in enumerate(self.optimizers):
+                has_grad = False
+                for param in self.model.a2c_network.nets[i].parameters():
+                    if param.grad is not None and torch.norm(param.grad) > 1e-4:
+                        has_grad = True
+                        break
+                if has_grad:
+                    self.scaler.step(optimizer)
+        else:
+            self.scaler.step(self.optimizer)
         self.scaler.update()
 
     def load_networks(self, params):
@@ -349,7 +391,7 @@ class A2CBase(BaseAlgorithm):
             network = builder.load(params['config']['sea_config'])
             self.config['sea_config']['network'] = network
 
-    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
+    def write_stats(self, total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, rnd_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames):
         # do we need scaled time?
         self.diagnostics.send_info(self.writer)
         self.writer.add_scalar('performance/step_inference_rl_update_fps', curr_frames / scaled_time, frame)
@@ -360,10 +402,15 @@ class A2CBase(BaseAlgorithm):
         self.writer.add_scalar('performance/step_time', step_time, frame)
 
         if not self.no_train_actor_critic:
-            self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
-            self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
-                    
-            self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
+            write_dict_stats(self.writer, "losses/a_loss", get_dict_losses(a_losses), frame)
+            write_dict_stats(self.writer, "losses/c_loss", get_dict_losses(c_losses), frame)
+            write_dict_stats(self.writer, "losses/rnd_loss", get_dict_losses(rnd_losses), frame)
+            write_dict_stats(self.writer, "losses/entropy", get_dict_losses(entropies), frame)
+            # self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(a_losses).item(), frame)
+            # self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(c_losses).item(), frame)
+            # self.writer.add_scalar('losses/rnd_loss', torch_ext.mean_list(rnd_losses).item(), frame)
+            # self.writer.add_scalar('losses/entropy', torch_ext.mean_list(entropies).item(), frame)
+
             self.writer.add_scalar('info/last_lr', last_lr * lr_mul, frame)
             self.writer.add_scalar('info/lr_mul', lr_mul, frame)
             self.writer.add_scalar('info/e_clip', self.e_clip * lr_mul, frame)
@@ -388,8 +435,13 @@ class A2CBase(BaseAlgorithm):
             dist.broadcast(lr_tensor, 0)
             lr = lr_tensor.item()
 
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+        if self.multi_optimizer:
+            for optimizer in self.optimizers:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+        else:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
         
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
@@ -414,6 +466,11 @@ class A2CBase(BaseAlgorithm):
                 }
                 value = self.get_central_value(input_dict)
                 res_dict['values'] = value
+            if 'rnd_gt' in res_dict and res_dict['rnd_gt'] is not None:
+                rnd_gt = res_dict.pop('rnd_gt')
+                rnd_pred = res_dict.pop('rnd_pred')
+                # print(rnd_gt.shape, rnd_pred.shape)
+                res_dict['rnd_error'] = torch.square(rnd_pred - rnd_gt).sum(-1) / np.sqrt(rnd_pred.shape[-1])
         return res_dict
 
     def get_values(self, obs):
@@ -478,6 +535,7 @@ class A2CBase(BaseAlgorithm):
         self.current_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_shaped_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.ppo_device)
+        self.current_achievements = [set() for _ in range(self.batch_size)]
         self.dones = torch.ones((batch_size,), dtype=torch.uint8, device=self.ppo_device)
 
         if self.use_sea:
@@ -625,7 +683,11 @@ class A2CBase(BaseAlgorithm):
     def get_full_state_weights(self):
         state = self.get_weights()
         state['epoch'] = self.epoch_num
-        state['optimizer'] = self.optimizer.state_dict()
+        if self.multi_optimizer:
+            for i, optimizer in enumerate(self.optimizers):
+                state[f'optimizer_{i}'] = optimizer.state_dict()
+        else:
+            state['optimizer'] = self.optimizer.state_dict()
         if self.has_central_value:
             state['assymetric_vf_nets'] = self.central_value_net.state_dict()
         if self.use_sea:
@@ -648,7 +710,11 @@ class A2CBase(BaseAlgorithm):
         if not self.only_load_weights:
             self.epoch_num = weights['epoch'] # frames as well?
             self.frame = weights.get('frame', 0)
-            self.optimizer.load_state_dict(weights['optimizer'])
+            if self.multi_optimizer:
+                for i in range(len(self.optimizers)):
+                    self.optimizers[i].load_state_dict(weights[f'optimizer_{i}'])
+            else:
+                self.optimizer.load_state_dict(weights['optimizer'])
             self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 
             env_state = weights.get('env_state', None)
@@ -733,6 +799,7 @@ class A2CBase(BaseAlgorithm):
 
             if self.use_sea:
                 last_obs = self.obs['obs']['observation'].clone()
+                last_objective = self.obs['obs']['objective'].clone()
 
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
@@ -742,13 +809,21 @@ class A2CBase(BaseAlgorithm):
                 # self.true_dones = torch.zeros_like(self.dones)
                 for i in range(rewards.shape[0]):
                     self.sea_buffer.add(last_obs[i], res_dict['actions'][i], self.obs['obs']['observation'][i], rewards[i])
-                    if rewards[i] > 0.1:
+                    if rewards[i] > 0.5:
                         self.achievement_buffer.add(i, last_obs[i], res_dict['actions'][i], self.obs['obs']['observation'][i])
-                    if infos[i]["env_is_done"]:
+                    if infos["env_is_done"][i]:
                         self.achievement_buffer.episode_done(i)
-                    self.true_dones[i] = int(infos[i]["env_is_done"])
+                    self.true_dones[i] = int(infos["env_is_done"][i])
+                    self.current_achievements[i] |= set(infos["step_completed"][i])
 
             step_time += (step_time_end - step_time_start)
+
+            if 'rnd_error' in res_dict:
+                # print(rewards.shape, res_dict['rnd_error'].shape)
+                # print(res_dict['rnd_error'][:10])
+                # obs_diff = (self.obs['obs']['observation'] - last_obs).square().sum(1)
+                rewards += res_dict['rnd_error'].unsqueeze(-1) * self.rnd_reward_coef
+                # rewards += obs_diff.unsqueeze(-1) * self.rnd_reward_coef
 
             shaped_rewards = self.rewards_shaper(rewards)
             if self.value_bootstrap and 'time_outs' in infos:
@@ -767,16 +842,11 @@ class A2CBase(BaseAlgorithm):
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
-            not_dones = 1.0 - self.dones.float()
-
-            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
-            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
-            self.current_lengths = self.current_lengths * not_dones
-
             if self.use_sea:
                 self.current_achv_rewards += rewards
                 # print(infos[0]["env_reward"], len(infos), self.current_env_rewards.shape)
-                self.current_env_rewards[:, 0] += torch.tensor([infos[i]["env_reward"] for i in range(len(infos))], dtype=torch.float32, device=rewards.device)
+                # self.current_env_rewards[:, 0] += torch.tensor(infos["env_reward"], dtype=torch.float32, device=rewards.device)
+                self.current_env_rewards[:, 0] += infos["env_reward"].clone().detach()
                 self.current_true_lengths += 1
                 true_done_indices = self.true_dones.nonzero(as_tuple=False)
 
@@ -789,6 +859,31 @@ class A2CBase(BaseAlgorithm):
                 self.current_achv_rewards = self.current_achv_rewards * true_not_dones.unsqueeze(1)
                 self.current_env_rewards = self.current_env_rewards * true_not_dones.unsqueeze(1)
                 self.current_true_lengths = self.current_true_lengths * true_not_dones
+
+                for i in range(rewards.shape[0]):
+                    if self.dones[i]:
+                        objective = last_objective[i].nonzero().item()
+                        named_objective = self.vec_env.objective_selector.known_objectives[objective]
+                        if named_objective not in self.objective_rewards:
+                            self.objective_rewards[named_objective] = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
+                        self.objective_rewards[named_objective].update(torch.ones((1,)) * self.current_rewards[i].item())
+                    if self.true_dones[i]:
+                        # if len(self.current_achievements[i]) > 0:
+                        #     print(self.current_achievements)
+                        for achv in self.current_achievements[i]:
+                            if achv not in self.achievement_completions:
+                                self.achievement_completions[achv] = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
+                            self.achievement_completions[achv].update(torch.ones((1,)))
+                        for achv in self.achievement_completions.keys():
+                            if achv not in self.current_achievements[i]:
+                                self.achievement_completions[achv].update(torch.zeros((1,)))
+                        self.current_achievements[i] = set()
+            
+            not_dones = 1.0 - self.dones.float()
+            
+            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
+            self.current_lengths = self.current_lengths * not_dones
 
         last_values = self.get_values(self.obs)
 
@@ -830,6 +925,7 @@ class A2CBase(BaseAlgorithm):
 
             if self.use_sea:
                 last_obs = self.obs['obs']['observation'].clone()
+                last_objective = self.obs['obs']['objective'].clone()
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
@@ -845,11 +941,12 @@ class A2CBase(BaseAlgorithm):
             if self.use_sea:
                 for i in range(rewards.shape[0]):
                     self.sea_buffer.add(last_obs[i], res_dict['actions'][i], self.obs['obs']['observation'][i], rewards[i])
-                    if rewards[i] > 0.1:
+                    if rewards[i] > 0.5:
                         self.achievement_buffer.add(i, last_obs[i], res_dict['action'][i], self.obs['obs']['observation'][i])
-                    if infos[i]["env_is_done"]:
+                    if infos["env_is_done"][i]:
                         self.achievement_buffer.episode_done(i)
-                    self.true_dones[i] = int(infos[i]["env_is_done"])
+                    self.true_dones[i] = int(infos["env_is_done"][i])
+                    self.current_achievements[i] |= set(infos["step_completed"][i])
 
             shaped_rewards = self.rewards_shaper(rewards)
 
@@ -876,15 +973,10 @@ class A2CBase(BaseAlgorithm):
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
-            not_dones = 1.0 - self.dones.float()
-
-            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
-            self.current_lengths = self.current_lengths * not_dones
-
             if self.use_sea:
                 self.current_achv_rewards += rewards
                 # print(infos[0]["env_reward"], len(infos), self.current_env_rewards.shape)
-                self.current_env_rewards[:, 0] += torch.tensor([infos[i]["env_reward"] for i in range(len(infos))], dtype=torch.float32, device=rewards.device)
+                self.current_env_rewards[:, 0] += torch.tensor(infos["env_reward"], dtype=torch.float32, device=rewards.device)
                 self.current_true_lengths += 1
                 true_done_indices = self.true_dones.nonzero(as_tuple=False)
 
@@ -897,6 +989,28 @@ class A2CBase(BaseAlgorithm):
                 self.current_achv_rewards = self.current_achv_rewards * true_not_dones.unsqueeze(1)
                 self.current_env_rewards = self.current_env_rewards * true_not_dones.unsqueeze(1)
                 self.current_true_lengths = self.current_true_lengths * true_not_dones
+
+                for i in range(rewards.shape[0]):
+                    if self.dones[i]:
+                        objective = last_objective[i].nonzero().item()
+                        named_objective = self.vec_env.objective_selector.known_objectives[objective]
+                        if named_objective not in self.objective_rewards:
+                            self.objective_rewards[named_objective] = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
+                        self.objective_rewards[named_objective].update(torch.ones((1,)) * self.current_rewards[i].item())
+                    if self.true_dones[i]:
+                        for achv in self.current_achievements[i]:
+                            if achv not in self.achievement_completions:
+                                self.achievement_completions[achv] = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
+                            self.achievement_completions[achv].update(torch.ones((1,)))
+                        for achv in self.achievement_completions.keys():
+                            if achv not in self.current_achievements[i]:
+                                self.achievement_completions[achv].update(torch.zeros((1,)))
+                        self.current_achievements[i] = set()
+
+            not_dones = 1.0 - self.dones.float()
+
+            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_lengths = self.current_lengths * not_dones
 
         last_values = self.get_values(self.obs)
 
@@ -955,6 +1069,8 @@ class DiscreteA2CBase(A2CBase):
                 batch_dict = self.play_steps_rnn()
             else:
                 batch_dict = self.play_steps()
+
+        self.vec_env.objective_selector.print()
 
         self.set_train()
 
@@ -1016,15 +1132,18 @@ class DiscreteA2CBase(A2CBase):
         neglogpacs = batch_dict['neglogpacs']
         dones = batch_dict['dones']
         rnn_states = batch_dict.get('rnn_states', None)
+        objectives = batch_dict['obses'].get('objective', None)
         
         obses = batch_dict['obses']
         advantages = returns - values
 
         if self.normalize_value:
-            self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
+            # self.value_mean_std.train()
+            # values = self.value_mean_std(values)
+            # returns = self.value_mean_std(returns)
+            # self.value_mean_std.eval()
+            values = self.model.norm_value(values, objectives)
+            returns = self.model.norm_value(returns, objectives)
             
         
         advantages = torch.sum(advantages, axis=1)
@@ -1039,7 +1158,14 @@ class DiscreteA2CBase(A2CBase):
                 if self.normalize_rms_advantage:
                     advantages = self.advantage_mean_std(advantages)
                 else:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    if objectives is not None:
+                        for i in range(objectives.shape[1]):
+                            indices = objectives[:, i].nonzero()
+                            if indices.shape[0] > 0:
+                                adv = advantages[indices]
+                                advantages[indices] = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    else:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset_dict = {}
         dataset_dict['old_values'] = values
@@ -1145,6 +1271,10 @@ class DiscreteA2CBase(A2CBase):
                             self.writer.add_scalar('sea/true_episode_lengths/iter', mean_true_lengths, epoch_num)
                             self.writer.add_scalar('sea/true_episode_lengths/time', mean_true_lengths, total_time)
                             self.mean_rewards = mean_achv_rewards[0]
+                            for key, meter in self.achievement_completions.items():
+                                self.writer.add_scalar(f'achievement/{key}', meter.get_mean(), frame)
+                            for key, meter in self.objective_rewards.items():
+                                self.writer.add_scalar(f'objective_reward/{key}', meter.get_mean(), frame)
                     else:
                         self.writer.add_scalar('sea/env_reward/step', mean_rewards[0], frame)
                         self.writer.add_scalar('sea/env_reward/iter', mean_rewards[0], epoch_num)
@@ -1159,6 +1289,9 @@ class DiscreteA2CBase(A2CBase):
                     if self.save_freq > 0:
                         if (epoch_num % self.save_freq == 0) and (mean_rewards <= self.last_mean_rewards):
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+
+                    if self.use_sea:
+                        torch_ext.save_checkpoint(os.path.join(self.nn_dir, 'objective_selector'), self.vec_env.get_selector_states())
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1199,8 +1332,11 @@ class DiscreteA2CBase(A2CBase):
                 should_exit = should_exit_t.bool().item()
 
             if should_exit:
-                if self.use_sea and self.save_achievement_buffer:
-                    self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
+                if self.use_sea:
+                    if self.save_achievement_buffer:
+                        self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
+                    torch_ext.save_checkpoint(os.path.join(self.nn_dir, 'objective_selector'), self.vec_env.get_selector_states())
+                    
 
             if should_exit:
                 return self.last_mean_rewards, epoch_num
@@ -1215,6 +1351,8 @@ class ContinuousA2CBase(A2CBase):
         action_space = self.env_info['action_space']
         self.actions_num = action_space.shape[0]
         self.bounds_loss_coef = self.config.get('bounds_loss_coef', None)
+        self.rnd_loss_coef = self.config.get('rnd_loss_coef', 1.0)
+        self.rnd_reward_coef = self.config.get('rnd_reward_coef', 1.0)
 
         self.clip_actions = self.config.get('clip_actions', True)
 
@@ -1267,6 +1405,7 @@ class ContinuousA2CBase(A2CBase):
         a_losses = []
         c_losses = []
         b_losses = []
+        rnd_losses = []
         entropies = []
         kls = []
 
@@ -1274,9 +1413,10 @@ class ContinuousA2CBase(A2CBase):
             for mini_ep in range(0, self.mini_epochs_num):
                 ep_kls = []
                 for i in range(len(self.dataset)):
-                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                    a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, rnd_loss = self.train_actor_critic(self.dataset[i])
                     a_losses.append(a_loss)
                     c_losses.append(c_loss)
+                    rnd_losses.append(rnd_loss)
                     ep_kls.append(kl)
                     entropies.append(entropy)
                     if self.bounds_loss_coef is not None:
@@ -1312,7 +1452,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, rnd_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1325,14 +1465,17 @@ class ContinuousA2CBase(A2CBase):
         sigmas = batch_dict['sigmas']
         rnn_states = batch_dict.get('rnn_states', None)
         rnn_masks = batch_dict.get('rnn_masks', None)
+        objectives = batch_dict['obses'].get('objective', None)
 
         advantages = returns - values
 
         if self.normalize_value:
-            self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
+            # self.value_mean_std.train()
+            # values = self.value_mean_std(values)
+            # returns = self.value_mean_std(returns)
+            # self.value_mean_std.eval()
+            values = self.model.norm_value(values, objectives)
+            returns = self.model.norm_value(returns, objectives)
 
         advantages = torch.sum(advantages, axis=1)
 
@@ -1346,7 +1489,14 @@ class ContinuousA2CBase(A2CBase):
                 if self.normalize_rms_advantage:
                     advantages = self.advantage_mean_std(advantages)
                 else:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    if objectives is not None:
+                        for i in range(objectives.shape[1]):
+                            indices = objectives[:, i].nonzero()
+                            if indices.shape[0] > 0:
+                                adv = advantages[indices]
+                                advantages[indices] = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    else:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset_dict = {}
         dataset_dict['old_values'] = values
@@ -1391,13 +1541,39 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, rnd_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
+
+            self.vec_env.objective_selector.print()
 
             # cleaning memory to optimize space
             self.dataset.update_values_dict(None)
             should_exit = False
+
+            # reset_ids = []
+            # # for achv, meter in self.achievement_completions.items():
+            # #     achv_id = self.vec_env.objective_selector.objective_map[achv]
+            # #     completion_rate = meter.get_mean().mean()
+            # #     if completion_rate < 1e-2 and meter.current_size >= meter.max_size:
+            # #         print(f"{achv} too low completion rate ({completion_rate}), resetting net.")
+            # #         reset_ids.append(achv_id)
+            # #         meter.clear()
+
+            # if 'explore-0' in self.objective_rewards:
+            #     meter = self.objective_rewards['explore-0']
+            #     explore_rewards = meter.get_mean().mean()
+            #     print(explore_rewards, meter.current_size, meter.max_size)
+            #     if explore_rewards < 1e-3 and meter.current_size >= meter.max_size:
+            #         print(f"explore reward too low ({explore_rewards}), resetting net.")
+            #         reset_ids.append(0)
+            #         meter.clear()
+            # # else:
+            # #     print(self.objective_rewards.keys())
+
+            # for achv_id in reset_ids:
+            #     self.model.a2c_network.nets[achv_id].reset()
+            #     self.optimizers[achv_id] = self.optimizer_fns[achv_id]()
 
             if self.rank == 0:
                 self.diagnostics.epoch(self, current_epoch = epoch_num)
@@ -1411,11 +1587,12 @@ class ContinuousA2CBase(A2CBase):
                                 epoch_num, self.max_epochs, frame, self.max_frames)
 
                 self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
-                                a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
+                                a_losses, c_losses, rnd_losses, entropies, kls, last_lr, lr_mul, frame,
                                 scaled_time, scaled_play_time, curr_frames)
 
                 if len(b_losses) > 0:
-                    self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                    # self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                    write_dict_stats(self.writer, 'losses/bounds_loss', get_dict_losses(b_losses), frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
@@ -1454,6 +1631,10 @@ class ContinuousA2CBase(A2CBase):
                             self.writer.add_scalar('sea/true_episode_lengths/iter', mean_true_lengths, epoch_num)
                             self.writer.add_scalar('sea/true_episode_lengths/time', mean_true_lengths, total_time)
                             self.mean_rewards = mean_achv_rewards[0]
+                            for key, meter in self.achievement_completions.items():
+                                self.writer.add_scalar(f'achievement/{key}', meter.get_mean(), frame)
+                            for key, meter in self.objective_rewards.items():
+                                self.writer.add_scalar(f'objective_reward/{key}', meter.get_mean(), frame)
                     else:
                         self.writer.add_scalar('sea/env_reward/step', mean_rewards[0], frame)
                         self.writer.add_scalar('sea/env_reward/iter', mean_rewards[0], epoch_num)
@@ -1467,6 +1648,9 @@ class ContinuousA2CBase(A2CBase):
                     if self.save_freq > 0:
                         if (epoch_num % self.save_freq == 0) and (mean_rewards[0] <= self.last_mean_rewards):
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+
+                    if self.use_sea:
+                        torch_ext.save_checkpoint(os.path.join(self.nn_dir, 'objective_selector'), self.vec_env.get_selector_states())
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1507,8 +1691,10 @@ class ContinuousA2CBase(A2CBase):
                 should_exit = should_exit_t.float().item()
 
             if should_exit:
-                if self.use_sea and self.save_achievement_buffer:
-                    self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
+                if self.use_sea:
+                    if self.save_achievement_buffer:
+                        self.achievement_buffer.save(os.path.join(self.nn_dir, 'achievement_buffer'))
+                    torch_ext.save_checkpoint(os.path.join(self.nn_dir, 'objective_selector'), self.vec_env.objective_selector.export())
 
             if should_exit:
                 return self.last_mean_rewards, epoch_num

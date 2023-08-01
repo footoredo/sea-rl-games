@@ -32,15 +32,21 @@ class BaseModel():
             normalize_value=normalize_value, normalize_input=normalize_input, value_size=value_size)
 
 class BaseModelNetwork(nn.Module):
-    def __init__(self, obs_shape, normalize_value, normalize_input, value_size):
+    def __init__(self, obs_shape, normalize_value, normalize_input, value_size, objective_num=None):
         nn.Module.__init__(self)
         self.obs_shape = obs_shape
         self.normalize_value = normalize_value
         self.normalize_input = normalize_input
         self.value_size = value_size
+        self.objective_num = objective_num
 
         if normalize_value:
-            self.value_mean_std = RunningMeanStd((self.value_size,)) #   GeneralizedMovingStats((self.value_size,)) #   
+            if objective_num is not None:
+                self.value_mean_stds = []
+                for i in range(objective_num):
+                    self.value_mean_stds.append(RunningMeanStd((self.value_size,))) #   GeneralizedMovingStats((self.value_size,)) #   
+            else:
+                self.value_mean_std = RunningMeanStd((self.value_size,)) #   GeneralizedMovingStats((self.value_size,)) #   
         if normalize_input:
             if isinstance(obs_shape, dict):
                 self.running_mean_std = RunningMeanStdObs(obs_shape)
@@ -50,10 +56,27 @@ class BaseModelNetwork(nn.Module):
     def norm_obs(self, observation):
         with torch.no_grad():
             return self.running_mean_std(observation) if self.normalize_input else observation
+        
+    def norm_value(self, value, objective=None, denorm=False):
+        if not self.normalize_value:
+            return value
+        else:
+            with torch.no_grad():
+                if self.objective_num is not None:
+                    for i in range(self.objective_num):
+                        indices = objective[:, i].nonzero()
+                        if indices.shape[0] > 0:
+                            gathered_value = value[indices]
+                            if not denorm:
+                                self.value_mean_stds[i].train()
+                            value[indices] = self.value_mean_stds[i](gathered_value, denorm=denorm)
+                            if not denorm:
+                                self.value_mean_stds[i].eval()
+                else:
+                    return self.value_mean_std(value, denorm=denorm) if self.normalize_value else value
 
-    def denorm_value(self, value):
-        with torch.no_grad():
-            return self.value_mean_std(value, denorm=True) if self.normalize_value else value
+    def denorm_value(self, value, objective=None):
+        return self.norm_value(value, objective, denorm=True)
 
 class ModelA2C(BaseModel):
     def __init__(self, network):
@@ -259,9 +282,11 @@ class ModelA2CContinuousLogStd(BaseModel):
             is_train = input_dict.get('is_train', True)
             prev_actions = input_dict.get('prev_actions', None)
             input_dict['obs'] = self.norm_obs(input_dict['obs'])
-            mu, logstd, value, states = self.a2c_network(input_dict)
+            mu, logstd, value, states, rnd_gt, rnd_pred = self.a2c_network(input_dict)
             sigma = torch.exp(logstd)
+            # print(sigma, mu)
             distr = torch.distributions.Normal(mu, sigma, validate_args=False)
+            # print(input_dict['obs']['objective'][0], value[0])
             if is_train:
                 entropy = distr.entropy().sum(dim=-1)
                 prev_neglogp = self.neglogp(prev_actions, mu, sigma, logstd)
@@ -271,7 +296,9 @@ class ModelA2CContinuousLogStd(BaseModel):
                     'entropy' : entropy,
                     'rnn_states' : states,
                     'mus' : mu,
-                    'sigmas' : sigma
+                    'sigmas' : sigma,
+                    'rnd_gt' : rnd_gt,
+                    'rnd_pred' : rnd_pred
                 }                
                 return result
             else:
@@ -283,7 +310,9 @@ class ModelA2CContinuousLogStd(BaseModel):
                     'actions' : selected_action,
                     'rnn_states' : states,
                     'mus' : mu,
-                    'sigmas' : sigma
+                    'sigmas' : sigma,
+                    'rnd_gt' : rnd_gt,
+                    'rnd_pred' : rnd_pred
                 }
                 return result
 

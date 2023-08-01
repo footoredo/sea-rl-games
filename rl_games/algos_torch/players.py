@@ -76,6 +76,8 @@ class PpoPlayerContinuous(BasePlayer):
         }
         with torch.no_grad():
             res_dict = self.model(input_dict)
+        
+        # print("values", res_dict["values"])
         mu = res_dict['mus']
         action = res_dict['actions']
         self.states = res_dict['rnn_states']

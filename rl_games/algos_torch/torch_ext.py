@@ -127,13 +127,32 @@ def random_sample(obs_batch, prob):
 def mean_list(val):
     return torch.mean(torch.stack(val))
 
-def apply_masks(losses, mask=None):
+def apply_masks(losses, mask=None, objective=None):
     sum_mask = None
     if mask is not None:
         mask = mask.unsqueeze(1)
         sum_mask = mask.numel()#
         #sum_mask = mask.sum()
         res_losses = [(l * mask).sum() / sum_mask for l in losses]
+    elif objective is not None:
+        num_obj = objective.shape[1]
+        sum_objective = torch.sum(objective, 0)  # [num_obj]
+        scale = torch.matmul(objective, sum_objective.unsqueeze(1))[:, 0]  # [batch]
+        res_losses = []
+        dict_losses = []
+        for loss in losses:
+            mean_loss = torch.mean(loss, dim=list(range(1, len(loss.shape))))
+            scaled_loss = mean_loss / scale  # [batch]
+            obj_scaled_loss = scaled_loss.unsqueeze(1) * objective  # [batch, num_obj]
+            dict_loss = {}
+            for i in range(num_obj):
+                if sum_objective[i] > 0:
+                    dict_loss[i] = obj_scaled_loss[:, i].sum()
+            res_losses.append(scaled_loss.sum())
+            dict_losses.append(dict_loss)
+        res_losses = res_losses + dict_losses
+
+        # res_losses = [torch.sum(l / scale, 0, keepdim=True).mean() for l in losses]
     else:
         res_losses = [torch.mean(l) for l in losses]
     

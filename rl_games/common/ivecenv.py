@@ -35,6 +35,18 @@ class IVecEnv:
     def set_env_state(self, env_state):
         pass
 
+    @property
+    def unwrapped(self):
+        return self
+    
+    @property
+    def observation_space(self):
+        return self.get_env_info()["observation_space"]
+    
+    @property
+    def action_space(self):
+        return self.get_env_info()["action_space"]
+
 
 class IVecEnvWrapper(IVecEnv):
     def __init__(self, env: IVecEnv):
@@ -67,3 +79,7 @@ class IVecEnvWrapper(IVecEnv):
 
     def set_env_state(self, env_state):
         return self.env.set_env_state(env_state)
+
+    @property
+    def unwrapped(self):
+        return self.env.unwrapped

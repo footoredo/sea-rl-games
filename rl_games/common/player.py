@@ -176,8 +176,7 @@ class BasePlayer(object):
     def create_env(self):
         env = env_configurations.configurations[self.env_name]['env_creator'](**self.env_config)
         if self.use_sea:
-            objective_dim = self.sea_config['objective_dim']
-            env = SEAWrapper(env, objective_dim)
+            env = SEAWrapper(env, **self.sea_config['env_config'])
         return env
 
     def get_action(self, obs, is_deterministic=False):

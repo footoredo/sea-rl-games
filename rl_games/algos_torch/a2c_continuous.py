@@ -21,7 +21,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             'num_seqs' : self.num_actors * self.num_agents,
             'value_size': self.env_info.get('value_size',1),
             'normalize_value' : self.normalize_value,
-            'normalize_input': self.normalize_input
+            'normalize_input': self.normalize_input,
+            'use_rnd': self.use_rnd
         }
         
         self.model = self.network.build(build_config)
@@ -30,7 +31,16 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
         self.bound_loss_type = self.config.get('bound_loss_type', 'bound') # 'regularisation' or 'bound'
-        self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.multi_optimizer = True
+        self.optimizers = []
+        self.optimizer_fns = []
+        self.num_nets = len(self.model.a2c_network.nets)
+        for i in range(self.num_nets):
+            self.optimizer_fns.append(lambda: optim.Adam(self.model.a2c_network.nets[i].parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay))
+            self.optimizers.append(self.optimizer_fns[-1]())
+        # self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        # self.optimizer = optim.SGD(self.model.parameters(), float(self.last_lr) * 100)
+        # self.optimizer = optim.SparseAdam(self.model.parameters(), float(self.last_lr), eps=1e-08)
 
         if self.has_central_value:
             cv_config = {
@@ -73,8 +83,8 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         self.use_experimental_cv = self.config.get('use_experimental_cv', True)
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_len)
-        if self.normalize_value:
-            self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
+        # if self.normalize_value:
+        #     self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
@@ -125,11 +135,22 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
+            if 'objective' in batch_dict['obs']:
+                objective = batch_dict['obs']['objective']
+            else:
+                objective = None
             action_log_probs = res_dict['prev_neglogp']
             values = res_dict['values']
             entropy = res_dict['entropy']
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
+
+            if 'rnd_gt' in res_dict and res_dict['rnd_gt'] is not None:
+                rnd_gt = res_dict['rnd_gt']
+                rnd_pred = res_dict['rnd_pred']
+                rnd_loss = 0.5 * torch.square(rnd_gt - rnd_pred).sum(-1).mean()
+            else:
+                rnd_loss = torch.zeros(1, device=self.ppo_device)
 
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
@@ -143,10 +164,10 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 b_loss = self.bound_loss(mu)
             else:
                 b_loss = torch.zeros(1, device=self.ppo_device)
-            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
-            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks, objective)
+            a_loss, c_loss, entropy, b_loss, dict_a_loss, dict_c_loss, dict_entropy, dict_b_loss = losses
 
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef + rnd_loss * self.rnd_loss_coef
             
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -156,6 +177,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         if not self.no_train_actor_critic:
             self.scaler.scale(loss).backward()
+            # loss.backward()
             #TODO: Refactor this ugliest code of they year
             self.trancate_gradients_and_step()
 
@@ -174,9 +196,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             'masks' : rnn_masks
         }, curr_e_clip, 0)      
 
-        self.train_result = (a_loss, c_loss, entropy, \
+        self.train_result = (dict_a_loss, dict_c_loss, dict_entropy, \
             kl_dist, self.last_lr, lr_mul, \
-            mu.detach(), sigma.detach(), b_loss)
+            mu.detach(), sigma.detach(), dict_b_loss, rnd_loss)
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)

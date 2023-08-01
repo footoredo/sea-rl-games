@@ -13,9 +13,23 @@ from torch import optim
 import torch 
 from torch import nn
 import torch.nn.functional as F
+import gym
 import numpy as np
 import time
 import os
+
+
+def clone_obs(obs):
+    if type(obs) == dict:
+        return { k: v.clone() for k, v in obs.items() }
+    else:
+        return obs.clone()
+
+def float_obs(obs):
+    if type(obs) == dict:
+        return { k: v.float() for k, v in obs.items() }
+    else:
+        return obs.float()
 
 
 class SACAgent(BaseAlgorithm):
@@ -27,6 +41,10 @@ class SACAgent(BaseAlgorithm):
 
         # TODO: Get obs shape and self.network
         self.load_networks(params)
+
+        self.use_sea = config.get('use_sea', False)
+        self.sea_config = config.get('sea_config', {})
+
         self.base_init(base_name, config)
         self.num_warmup_steps = config["num_warmup_steps"]
         self.gamma = config["gamma"]
@@ -37,6 +55,7 @@ class SACAgent(BaseAlgorithm):
         self.replay_buffer_size = config["replay_buffer_size"]
         self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
         self.normalize_input = config.get("normalize_input", False)
+
 
         self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
 
@@ -54,9 +73,14 @@ class SACAgent(BaseAlgorithm):
             float(self.env_info['action_space'].high.max())
         ]
 
-        obs_shape = torch_ext.shape_whc_to_cwh(self.obs_shape)
+        # obs_shape = torch_ext.shape_whc_to_cwh(self.obs_shape)
+        obs_shape = self.obs_shape
+        if self.use_sea:
+            obs_dim = self.env_info["observation_space"]["observation"].shape[0] + self.env_info["observation_space"]["objective"].shape[0]
+        else:
+            obs_dim = self.env_info["observation_space"]["observation"].shape[0]
         net_config = {
-            'obs_dim': self.env_info["observation_space"].shape[0],
+            'obs_dim': obs_dim,
             'action_dim': self.env_info["action_space"].shape[0],
             'actions_num' : self.actions_num,
             'input_shape' : obs_shape,
@@ -80,7 +104,7 @@ class SACAgent(BaseAlgorithm):
                                                     lr=float(self.config["alpha_lr"]),
                                                     betas=self.config.get("alphas_betas", [0.9, 0.999]))
 
-        self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
+        self.replay_buffer = experience.VectorizedReplayBuffer(obs_shape,
         self.env_info['action_space'].shape,
         self.replay_buffer_size,
         self._device)
@@ -102,8 +126,6 @@ class SACAgent(BaseAlgorithm):
         self.env_config = config.get('env_config', {})
         self.num_actors = config.get('num_actors', 1)
         self.env_name = config['env_name']
-        self.use_sea = config.get('use_sea', False)
-        self.sea_config = config.get('sea_config', {})
         print("Env name:", self.env_name)
 
         self.env_info = config.get('env_info')
@@ -138,7 +160,10 @@ class SACAgent(BaseAlgorithm):
         self.network = config['network']
         self.rewards_shaper = config['reward_shaper']
         self.num_agents = self.env_info.get('agents', 1)
-        self.obs_shape = self.observation_space.shape
+        if isinstance(self.observation_space, gym.spaces.Dict):
+            self.obs_shape = { k: v.shape for k, v in self.observation_space.items()}
+        else:
+            self.obs_shape = self.observation_space.shape
 
         self.games_to_track = self.config.get('games_to_track', 100)
         self.game_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self._device)
@@ -333,7 +358,7 @@ class SACAgent(BaseAlgorithm):
         return actor_loss_info, critic1_loss, critic2_loss
 
     def preproc_obs(self, obs):
-        if isinstance(obs, dict):
+        if isinstance(obs, dict) and 'obs' in obs:
             obs = obs['obs']
         obs = self.model.norm_obs(obs)
         return obs
@@ -439,7 +464,7 @@ class SACAgent(BaseAlgorithm):
                 action = torch.rand((self.num_actors, *self.env_info["action_space"].shape), device=self._device) * 2.0 - 1.0
             else:
                 with torch.no_grad():
-                    action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
+                    action = self.act(float_obs(obs), self.env_info["action_space"].shape, sample=True)
 
             step_start = time.time()
 
@@ -468,16 +493,16 @@ class SACAgent(BaseAlgorithm):
             self.current_rewards = self.current_rewards * not_dones
             self.current_lengths = self.current_lengths * not_dones
 
-            if isinstance(obs, dict):
+            if isinstance(obs, dict) and 'obs' in obs:
                 obs = obs['obs']
-            if isinstance(next_obs, dict):    
+            if isinstance(next_obs, dict) and 'obs' in next_obs:    
                 next_obs = next_obs['obs']
 
             rewards = self.rewards_shaper(rewards)
 
             self.replay_buffer.add(obs, action, torch.unsqueeze(rewards, 1), next_obs, torch.unsqueeze(dones, 1))
 
-            self.obs = obs = next_obs.clone()
+            self.obs = obs = clone_obs(next_obs)
 
             if not random_exploration:
                 self.set_train()
@@ -525,6 +550,8 @@ class SACAgent(BaseAlgorithm):
             fps_step = curr_frames / step_time
             fps_step_inference = curr_frames / play_time
             fps_total = curr_frames / epoch_total_time
+
+            self.vec_env.objective_selector.print()
 
             print_statistics(self.print_stats, curr_frames, step_time, play_time, epoch_total_time, 
                 self.epoch_num, self.max_epochs, self.frame, self.max_frames)
